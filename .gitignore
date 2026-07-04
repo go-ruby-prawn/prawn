@@ -1,0 +1,8 @@
+# Go test binaries: `go test -c` and an interrupted `go test` run leave a
+# `<pkg>.test` executable behind. Never commit them.
+*.test
+
+# Coverage profiles produced by `go test -coverprofile` / the CI coverage gate.
+cover.out
+*.cover
+coverage.txt
