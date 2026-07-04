@@ -30,10 +30,16 @@ jobs:
       - run: go version
       - run: go vet ./...
       - run: go build ./...
-      - name: Test + 100% coverage gate
+      - name: Verify the library is CGO-free
         shell: bash
         env:
           CGO_ENABLED: "0"
+        run: go build ./... && go vet ./...
+      # The race detector needs cgo, so this lane keeps CGO enabled; the CGO-free
+      # guarantee is enforced by the step above and by the CGO_ENABLED=0 arch
+      # lanes below.
+      - name: Test + 100% coverage gate
+        shell: bash
         run: |
           COVERPKG=$(go list ./... | paste -sd, -)
           go test -race -coverpkg="$COVERPKG" -coverprofile=cover.out ./...
