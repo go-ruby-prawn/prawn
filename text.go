@@ -11,203 +11,238 @@ import (
 	"unicode/utf8"
 )
 
-// ascentFactor approximates, as a fraction of the font size, the distance from
-// the top of a line box down to the text baseline. It positions glyphs within
-// the notional line box; it does not affect line advance.
-const ascentFactor = 0.75
-
 // TextOptions mirror the per-call keyword arguments of Prawn::Document#text /
-// #draw_text (:size, :style, :align, :leading, :color, and a per-call font
-// family). Zero-value fields keep the document's current settings; the
-// overrides apply only for the duration of the call, exactly as in prawn.
+// #draw_text (:size, :style, :align, :leading, :color, :kerning, and a per-call
+// font family). Zero-value fields keep the document's current settings.
 type TextOptions struct {
-	// Size overrides the font size in points for this call (0 = current size).
-	Size float64
-	// Style overrides the font style for this call.
-	Style Style
-	// StyleSet must be true to apply Style (so StyleNormal can be requested
-	// explicitly rather than being read as "unset").
+	Size     float64
+	Style    Style
 	StyleSet bool
-	// Font overrides the font family for this call ("" = current family).
-	Font string
-	// Align sets horizontal alignment (Text only; ignored by DrawText).
-	Align Align
-	// Leading adds extra leading (line spacing) in points for this call.
-	Leading float64
-	// Color overrides the fill (text) color for this call as a hex string
-	// "RRGGBB" or "#RRGGBB" ("" = current fill color).
-	Color string
+	Font     string
+	Align    Align
+	Leading  float64
+	Color    string
+	// Kerning, when KerningSet is true, overrides the document kerning flag.
+	Kerning    bool
+	KerningSet bool
 }
 
-// Font mirrors Prawn::Document#font(name, style:). It selects one of the 14
-// standard PDF fonts by prawn family name (case-insensitive) and an optional
-// style. An unregistered family records ErrUnknownFont.
+// Font mirrors Prawn::Document#font(name, style:). It selects a Core-14 built-in
+// family or a previously embedded TTF family by name and an optional style.
 func (d *Document) Font(name string, style Style) {
-	if _, ok := stdFonts[strings.ToLower(name)]; !ok {
-		d.fail(fmt.Errorf("%w: %s", ErrUnknownFont, name))
+	if isAFMFamily(name) {
+		d.curFont = d.registerAFM(name, style)
 		return
 	}
-	d.fontFamily = name
-	d.fontStyle = style
-	d.applyFont()
+	if fr, ok := d.fonts["ttf:"+name]; ok {
+		d.curFont = fr
+		return
+	}
+	d.fail(fmt.Errorf("%w: %s", ErrUnknownFont, name))
 }
 
-// FontFamily returns the current font family name.
-func (d *Document) FontFamily() string { return d.fontFamily }
-
-// FontStyle returns the current font style.
-func (d *Document) FontStyle() Style { return d.fontStyle }
-
-// FontSize mirrors Prawn::Document#font_size = n (the setter form): it sets the
-// current font size in points.
-func (d *Document) FontSize(size float64) {
-	d.fontSizePts = size
-	d.applyFont()
+// FontFamily returns the current font's PostScript/base name.
+func (d *Document) FontFamily() string {
+	if d.curFont.afm != nil {
+		return d.curFont.afm.Name
+	}
+	return d.curFont.ttf.name
 }
 
-// FontSizeValue mirrors Prawn::Document#font_size (the reader form).
-func (d *Document) FontSizeValue() float64 { return d.fontSizePts }
+// FontStyle reports the current style inferred from the base font name.
+func (d *Document) FontStyle() Style {
+	name := strings.ToLower(d.FontFamily())
+	bold := strings.Contains(name, "bold")
+	ital := strings.Contains(name, "italic") || strings.Contains(name, "oblique")
+	switch {
+	case bold && ital:
+		return StyleBoldItalic
+	case bold:
+		return StyleBold
+	case ital:
+		return StyleItalic
+	default:
+		return StyleNormal
+	}
+}
+
+// FontSize sets the current font size in points (Prawn::Document#font_size=).
+func (d *Document) FontSize(size float64) { d.fontSize = size }
+
+// FontSizeValue returns the current font size (Prawn::Document#font_size).
+func (d *Document) FontSizeValue() float64 { return d.fontSize }
 
 // Leading sets the document-wide extra leading (Prawn::Document#default_leading).
 func (d *Document) Leading(n float64) { d.leading = n }
 
-// FillColor mirrors Prawn::Document#fill_color = "RRGGBB": the color used to
-// fill shapes and paint text.
-func (d *Document) FillColor(hex string) {
-	rgb, err := parseHexColor(hex)
-	if err != nil {
-		d.fail(err)
-		return
+// LeadingValue returns the current default leading.
+func (d *Document) LeadingValue() float64 { return d.leading }
+
+// SetKerning enables or disables kerning for subsequent text (prawn default on).
+func (d *Document) SetKerning(on bool) { d.kerning = on }
+
+// KerningEnabled reports whether kerning is on.
+func (d *Document) KerningEnabled() bool { return d.kerning }
+
+// curAscender returns the current font's ascender at the given size.
+func (d *Document) curAscender(size float64) float64 {
+	if d.curFont.afm != nil {
+		return d.curFont.afm.ascenderScaled(size)
 	}
-	d.fillColor = rgb
-	d.applyFillColor()
+	return d.curFont.ttf.ascenderScaled(size)
 }
 
-// StrokeColor mirrors Prawn::Document#stroke_color = "RRGGBB": the color used to
-// stroke lines and shape outlines.
-func (d *Document) StrokeColor(hex string) {
-	rgb, err := parseHexColor(hex)
-	if err != nil {
-		d.fail(err)
-		return
+// curHeight returns the current font's line height at the given size.
+func (d *Document) curHeight(size float64) float64 {
+	if d.curFont.afm != nil {
+		return d.curFont.afm.height(size)
 	}
-	d.strokeColor = rgb
-	d.applyStrokeColor()
+	return d.curFont.ttf.height(size)
 }
 
-// FillColorValue and StrokeColorValue return the current colors as hex strings.
-func (d *Document) FillColorValue() string   { return hexOf(d.fillColor) }
-func (d *Document) StrokeColorValue() string { return hexOf(d.strokeColor) }
-
-func hexOf(c [3]int) string { return fmt.Sprintf("%02X%02X%02X", c[0], c[1], c[2]) }
-
-func parseHexColor(hex string) ([3]int, error) {
-	s := strings.TrimPrefix(hex, "#")
-	if len(s) != 6 {
-		return [3]int{}, fmt.Errorf("prawn: invalid color %q", hex)
-	}
-	var out [3]int
-	for i := 0; i < 3; i++ {
-		v, err := strconv.ParseUint(s[i*2:i*2+2], 16, 8)
-		if err != nil {
-			return [3]int{}, fmt.Errorf("prawn: invalid color %q", hex)
-		}
-		out[i] = int(v)
-	}
-	return out, nil
-}
-
-// lineHeight is the vertical advance for one line: the font size plus the
-// document leading plus any per-call leading. Prawn derives this from the font's
-// AFM ascender/descender/line-gap; here it is approximated as font_size +
-// leading, documented as such in doc.go.
+// lineHeight is one line's vertical advance: font height + document leading +
+// any per-call extra leading.
 func (d *Document) lineHeight(size, extraLeading float64) float64 {
-	return size + d.leading + extraLeading
+	return d.curHeight(size) + d.leading + extraLeading
 }
 
-// applyTextOptions applies per-call overrides and returns a function that
-// restores the previous state. A nil opts is a no-op.
-func (d *Document) applyTextOptions(opts *TextOptions) func() {
-	if opts == nil {
-		return func() {}
+// numToken renders a number the way prawn serializes font sizes and matrix
+// entries in a content stream: an integer when whole, otherwise real().
+func numToken(f float64) string {
+	if f == float64(int64(f)) {
+		return strconv.FormatInt(int64(f), 10)
 	}
-	prevFamily, prevStyle, prevSize := d.fontFamily, d.fontStyle, d.fontSizePts
-	prevFill := d.fillColor
-	changedFont := false
-	if opts.Font != "" {
-		if _, ok := stdFonts[strings.ToLower(opts.Font)]; !ok {
-			d.fail(fmt.Errorf("%w: %s", ErrUnknownFont, opts.Font))
-		} else {
-			d.fontFamily = opts.Font
-			changedFont = true
+	return formatReal(f)
+}
+
+// WidthOfString measures a UTF-8 string at the current font and size, applying
+// the document kerning flag (Prawn::Document#width_of).
+func (d *Document) WidthOfString(s string) float64 {
+	return d.widthOfSized(s, d.fontSize, d.kerning)
+}
+
+func (d *Document) widthOfSized(s string, size float64, kerning bool) float64 {
+	if d.curFont.afm != nil {
+		b, err := encodeWinAnsi(s)
+		if err != nil {
+			return 0
 		}
+		return d.curFont.afm.widthOf(b, size, kerning)
 	}
-	if opts.StyleSet {
-		d.fontStyle = opts.Style
-		changedFont = true
+	return d.curFont.ttf.widthOf(s, size)
+}
+
+// applyTextOptions applies per-call overrides and returns a restore function.
+func (d *Document) applyTextOptions(opts *TextOptions) func() {
+	prevFont, prevSize, prevKern := d.curFont, d.fontSize, d.kerning
+	if opts == nil {
+		return func() { d.curFont, d.fontSize, d.kerning = prevFont, prevSize, prevKern }
+	}
+	if opts.Font != "" || opts.StyleSet {
+		fam := opts.Font
+		style := d.FontStyle()
+		if opts.StyleSet {
+			style = opts.Style
+		}
+		if fam == "" {
+			fam = d.FontFamily()
+		}
+		d.Font(fam, style)
 	}
 	if opts.Size > 0 {
-		d.fontSizePts = opts.Size
-		changedFont = true
+		d.fontSize = opts.Size
 	}
-	if changedFont {
-		d.applyFont()
+	if opts.KerningSet {
+		d.kerning = opts.Kerning
 	}
 	changedColor := false
+	var prevFill colorVal
 	if opts.Color != "" {
-		if rgb, err := parseHexColor(opts.Color); err != nil {
-			d.fail(err)
-		} else {
-			d.fillColor = rgb
-			d.applyFillColor()
-			changedColor = true
-		}
+		prevFill = d.fillColor
+		d.FillColor(opts.Color)
+		changedColor = true
 	}
 	return func() {
-		d.fontFamily, d.fontStyle, d.fontSizePts = prevFamily, prevStyle, prevSize
-		if changedFont {
-			d.applyFont()
-		}
+		d.curFont, d.fontSize, d.kerning = prevFont, prevSize, prevKern
 		if changedColor {
 			d.fillColor = prevFill
-			d.applyFillColor()
+			d.emitFillColor()
 		}
 	}
 }
 
-// wrapText splits s into lines that each fit within width, honouring explicit
-// newlines. It relies on fpdf's font metrics (GetStringWidth) so wrapping
-// matches the emitted glyph widths.
-func (d *Document) wrapText(s string, width float64) []string {
-	var lines []string
-	for _, para := range strings.Split(s, "\n") {
-		wrapped := d.f.SplitText(para, width)
-		if len(wrapped) == 0 {
-			lines = append(lines, "")
-			continue
+// drawLine emits the BT/Td/Tf/(TJ|Tj)/ET operator group for a single line of
+// UTF-8 text whose baseline sits at the bounds-relative point (x, y), using the
+// current font, size and kerning flag. It records the font as used on the page.
+func (d *Document) drawLine(s string, x, y float64) {
+	d.cur.fontsUsed[d.curFont.resName] = true
+	ax, ay := d.mapToAbs(x, y)
+	c := d.cur.content
+	c.raw("BT")
+	c.op(ax, ay, "Td")
+	c.raw("/" + d.curFont.resName + " " + numToken(d.fontSize) + " Tf")
+	if d.curFont.afm != nil {
+		b, _ := encodeWinAnsi(s)
+		if d.kerning {
+			c.raw(tjOperand(b, d.curFont.afm, true) + " TJ")
+		} else {
+			c.raw("<" + hexEncode(b) + "> Tj")
 		}
-		lines = append(lines, wrapped...)
+	} else {
+		gids := d.curFont.ttf.encode(s)
+		c.raw("<" + hexEncode(gidBytes(gids)) + "> Tj")
 	}
-	return lines
+	c.raw("ET")
 }
 
-// alignOffset returns the x offset within a box of the given width for a line of
-// the given rendered width under the alignment.
+// alignOffset returns the x offset within a box of boxWidth for a line of
+// lineWidth under the alignment.
 func alignOffset(a Align, boxWidth, lineWidth float64) float64 {
 	switch a {
 	case AlignCenter:
 		return (boxWidth - lineWidth) / 2
 	case AlignRight:
 		return boxWidth - lineWidth
-	default: // AlignLeft, AlignJustify (treated as left for the last/short line)
+	default:
 		return 0
 	}
 }
 
-// Text mirrors Prawn::Document#text: it draws a string as flowing text that
-// wraps to the width of the margin box, starting at the current cursor and
-// advancing it downward. When the text reaches the bottom of the page it
-// continues on a new page (prawn's default flowing behaviour).
+// wrapText splits s into lines that each fit within width at the current font
+// and size, honouring explicit newlines.
+func (d *Document) wrapText(s string, width, size float64, kerning bool) []string {
+	var lines []string
+	for _, para := range strings.Split(s, "\n") {
+		lines = append(lines, d.wrapParagraph(para, width, size, kerning)...)
+	}
+	return lines
+}
+
+func (d *Document) wrapParagraph(para string, width, size float64, kerning bool) []string {
+	if para == "" {
+		return []string{""}
+	}
+	words := strings.Split(para, " ")
+	var out []string
+	cur := ""
+	for _, w := range words {
+		trial := w
+		if cur != "" {
+			trial = cur + " " + w
+		}
+		if d.widthOfSized(trial, size, kerning) <= width || cur == "" {
+			cur = trial
+		} else {
+			out = append(out, cur)
+			cur = w
+		}
+	}
+	out = append(out, cur)
+	return out
+}
+
+// Text mirrors Prawn::Document#text: flowing, wrapping, auto-paginating text
+// that starts at the cursor and advances it downward.
 func (d *Document) Text(s string, opts *TextOptions) {
 	if !utf8.ValidString(s) {
 		d.fail(ErrIncompatibleStringEncoding)
@@ -215,31 +250,35 @@ func (d *Document) Text(s string, opts *TextOptions) {
 	}
 	restore := d.applyTextOptions(opts)
 	defer restore()
-
+	if d.curFont.afm != nil {
+		if _, err := encodeWinAnsi(s); err != nil {
+			d.fail(err)
+			return
+		}
+	}
 	align := AlignLeft
 	extraLeading := 0.0
 	if opts != nil {
 		align = opts.Align
 		extraLeading = opts.Leading
 	}
-	width := d.boundsWidth()
-	lh := d.lineHeight(d.fontSizePts, extraLeading)
-	for _, line := range d.wrapText(s, width) {
+	width := d.bounds().width
+	lh := d.lineHeight(d.fontSize, extraLeading)
+	asc := d.curAscender(d.fontSize)
+	for _, line := range d.wrapText(s, width, d.fontSize, d.kerning) {
 		if d.cursor-lh < 0 {
 			d.StartNewPage()
 		}
-		lw := d.f.GetStringWidth(line)
+		lw := d.widthOfSized(line, d.fontSize, d.kerning)
 		x := alignOffset(align, width, lw)
-		baseline := d.cursor - d.fontSizePts*ascentFactor
-		fx, fy := d.toFpdfXY(x, baseline)
-		d.f.Text(fx, fy, line)
+		d.drawLine(line, x, d.cursor-asc)
 		d.cursor -= lh
 	}
 }
 
-// DrawText mirrors Prawn::Document#draw_text(string, at: [x, y]): it draws the
-// string once at an absolute point (bounds-relative, y measured up from the
-// bottom of the margin box) without any wrapping and without moving the cursor.
+// DrawText mirrors Prawn::Document#draw_text(string, at: [x, y]): one line at an
+// absolute (bounds-relative) point, no wrapping, cursor unchanged. The point is
+// the text baseline, as in prawn.
 func (d *Document) DrawText(s string, x, y float64, opts *TextOptions) {
 	if !utf8.ValidString(s) {
 		d.fail(ErrIncompatibleStringEncoding)
@@ -247,38 +286,34 @@ func (d *Document) DrawText(s string, x, y float64, opts *TextOptions) {
 	}
 	restore := d.applyTextOptions(opts)
 	defer restore()
-	fx, fy := d.toFpdfXY(x, y)
-	d.f.Text(fx, fy, s)
+	if d.curFont.afm != nil {
+		if _, err := encodeWinAnsi(s); err != nil {
+			d.fail(err)
+			return
+		}
+	}
+	d.drawLine(s, x, y)
 }
 
 // Overflow mirrors prawn's text_box :overflow modes.
 type Overflow int
 
 const (
-	// OverflowTruncate stops at the box boundary and returns the unprinted text
-	// (prawn :truncate, the default).
+	// OverflowTruncate stops at the box boundary, returning unprinted text.
 	OverflowTruncate Overflow = iota
-	// OverflowExpand draws every line even past the box height (prawn :expand).
+	// OverflowExpand draws every line even past the box height.
 	OverflowExpand
-	// OverflowError records ErrCannotFit if the text does not fit (prawn
-	// :error).
+	// OverflowError records ErrCannotFit if the text does not fit.
 	OverflowError
 )
 
 // TextBoxOptions mirror the keyword arguments of Prawn::Document#text_box.
 type TextBoxOptions struct {
-	// X, Y are the bounds-relative coordinates of the box's top-left corner
-	// (Y measured up from the bottom of the margin box).
-	X, Y float64
-	// Width is the box width in points (required, must be > 0).
-	Width float64
-	// Height, when > 0, bounds the box vertically and drives Overflow.
-	Height float64
-	// Align sets horizontal alignment within the box.
-	Align Align
-	// Overflow selects the behaviour when the text exceeds Height.
+	X, Y     float64
+	Width    float64
+	Height   float64
+	Align    Align
 	Overflow Overflow
-	// Size, Style, StyleSet, Font, Leading, Color mirror TextOptions for the box.
 	Size     float64
 	Style    Style
 	StyleSet bool
@@ -287,9 +322,9 @@ type TextBoxOptions struct {
 	Color    string
 }
 
-// TextBox mirrors Prawn::Document#text_box: it lays flowing text into a
-// positioned rectangle and returns the portion that did not fit (empty when all
-// of it was drawn). It does not move the document cursor.
+// TextBox mirrors Prawn::Document#text_box: lays flowing text into a positioned
+// rectangle and returns the portion that did not fit. It leaves the cursor
+// unchanged.
 func (d *Document) TextBox(s string, o TextBoxOptions) string {
 	if !utf8.ValidString(s) {
 		d.fail(ErrIncompatibleStringEncoding)
@@ -303,9 +338,16 @@ func (d *Document) TextBox(s string, o TextBoxOptions) string {
 		Size: o.Size, Style: o.Style, StyleSet: o.StyleSet, Font: o.Font, Color: o.Color,
 	})
 	defer restore()
+	if d.curFont.afm != nil {
+		if _, err := encodeWinAnsi(s); err != nil {
+			d.fail(err)
+			return s
+		}
+	}
 
-	lines := d.wrapText(s, o.Width)
-	lh := d.lineHeight(d.fontSizePts, o.Leading)
+	lines := d.wrapText(s, o.Width, d.fontSize, d.kerning)
+	lh := d.lineHeight(d.fontSize, o.Leading)
+	asc := d.curAscender(d.fontSize)
 	used := 0.0
 	printed := 0
 	for _, line := range lines {
@@ -317,12 +359,10 @@ func (d *Document) TextBox(s string, o TextBoxOptions) string {
 				break
 			}
 		}
-		lw := d.f.GetStringWidth(line)
+		lw := d.widthOfSized(line, d.fontSize, d.kerning)
 		x := o.X + alignOffset(o.Align, o.Width, lw)
-		top := o.Y - used
-		baseline := top - d.fontSizePts*ascentFactor
-		fx, fy := d.toFpdfXY(x, baseline)
-		d.f.Text(fx, fy, line)
+		baseline := o.Y - used - asc
+		d.drawLine(line, x, baseline)
 		used += lh
 		printed++
 	}

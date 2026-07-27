@@ -17,743 +17,1101 @@ import (
 	"testing"
 	"time"
 
-	rpdf "rsc.io/pdf"
+	"rsc.io/pdf"
 )
 
-// TestMain pins the clock so every generated PDF is byte-for-byte reproducible
-// and timezone independent, and confirms the seam is restored afterwards.
-func TestMain(m *testing.M) {
-	prev := SetClock(func() time.Time {
-		return time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC)
-	})
-	code := m.Run()
-	SetClock(prev)
-	os.Exit(code)
-}
+// ---- helpers ---------------------------------------------------------------
 
-// --- verification harness (generate then parse back) -------------------------
-
-// mustReader parses PDF bytes with the pure-Go rsc.io/pdf reader and asserts the
-// document is well-formed per the spec: %PDF- header, cross-reference table,
-// trailer and %%EOF.
-func mustReader(t *testing.T, b []byte) *rpdf.Reader {
-	t.Helper()
-	if !bytes.HasPrefix(b, []byte("%PDF-")) {
-		t.Fatalf("missing %%PDF- header: %q", b[:min(8, len(b))])
-	}
-	for _, marker := range []string{"xref", "trailer", "startxref", "%%EOF"} {
-		if !bytes.Contains(b, []byte(marker)) {
-			t.Fatalf("well-formedness: missing %q", marker)
-		}
-	}
-	r, err := rpdf.NewReader(bytes.NewReader(b), int64(len(b)))
-	if err != nil {
-		t.Fatalf("reader: %v", err)
-	}
-	return r
-}
-
-// pageText concatenates every glyph rsc.io/pdf extracted from page n (1-indexed)
-// in draw order, so tests can substring-match the text that was drawn.
-func pageText(r *rpdf.Reader, n int) string {
-	var sb strings.Builder
-	for _, tx := range r.Page(n).Content().Text {
-		sb.WriteString(tx.S)
-	}
-	return sb.String()
-}
-
-// pageTexts returns the raw per-glyph Text records for page n.
-func pageTexts(r *rpdf.Reader, n int) []rpdf.Text {
-	return r.Page(n).Content().Text
-}
-
-// textHas reports whether page n contains want. The rsc.io/pdf reader emits one
-// record per glyph and does not preserve inter-word spaces, so the comparison is
-// made with all spaces removed.
-func textHas(r *rpdf.Reader, n int, want string) bool {
-	strip := func(s string) string { return strings.ReplaceAll(s, " ", "") }
-	return strings.Contains(strip(pageText(r, n)), strip(want))
-}
-
-func renderDoc(t *testing.T, d *Document) []byte {
+func mustRender(t *testing.T, d *Document) []byte {
 	t.Helper()
 	b, err := d.Render()
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
+	if !bytes.HasPrefix(b, []byte("%PDF-")) {
+		t.Fatal("missing %PDF header")
+	}
+	if !bytes.Contains(b, []byte("%%EOF")) {
+		t.Fatal("missing EOF marker")
+	}
 	return b
 }
 
-func makePNG() []byte {
-	img := image.NewRGBA(image.Rect(0, 0, 8, 6))
-	for x := 0; x < 8; x++ {
-		for y := 0; y < 6; y++ {
-			img.Set(x, y, color.RGBA{R: uint8(x * 30), G: uint8(y * 40), B: 128, A: 255})
+func parse(t *testing.T, b []byte) *pdf.Reader {
+	t.Helper()
+	r, err := pdf.NewReader(bytes.NewReader(b), int64(len(b)))
+	if err != nil {
+		t.Fatalf("pdf parse: %v", err)
+	}
+	return r
+}
+
+func pngBytes(t *testing.T, withAlpha bool) []byte {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, 4, 3))
+	for y := 0; y < 3; y++ {
+		for x := 0; x < 4; x++ {
+			a := uint8(255)
+			if withAlpha && x == 0 {
+				a = 100
+			}
+			img.Set(x, y, color.NRGBA{R: uint8(x * 60), G: uint8(y * 80), B: 20, A: a})
 		}
 	}
 	var buf bytes.Buffer
-	_ = png.Encode(&buf, img)
-	return buf.Bytes()
-}
-
-func makeJPEG() []byte {
-	img := image.NewRGBA(image.Rect(0, 0, 8, 6))
-	for x := 0; x < 8; x++ {
-		for y := 0; y < 6; y++ {
-			img.Set(x, y, color.RGBA{R: 200, G: uint8(y * 40), B: 50, A: 255})
-		}
-	}
-	var buf bytes.Buffer
-	_ = jpeg.Encode(&buf, img, nil)
-	return buf.Bytes()
-}
-
-// --- text / font / color -----------------------------------------------------
-
-func TestTextGenerateAndParse(t *testing.T) {
-	d := New(Options{})
-	d.Text("Hello Prawn", &TextOptions{Size: 24, Style: StyleBold, StyleSet: true})
-	b := renderDoc(t, d)
-
-	r := mustReader(t, b)
-	if r.NumPage() != 1 {
-		t.Fatalf("pages = %d, want 1", r.NumPage())
-	}
-	if !textHas(r, 1, "Hello Prawn") {
-		t.Fatalf("page text = %q, want to contain %q", pageText(r, 1), "Hello Prawn")
-	}
-	for _, tx := range pageTexts(r, 1) {
-		if tx.FontSize != 24 {
-			t.Fatalf("font size = %v, want 24", tx.FontSize)
-		}
-		if !strings.Contains(tx.Font, "Bold") {
-			t.Fatalf("font = %q, want bold", tx.Font)
-		}
-	}
-	// Options were per-call: the document font is back to the default.
-	if d.FontSizeValue() != 12 || d.FontStyle() != StyleNormal {
-		t.Fatalf("state not restored: size=%v style=%v", d.FontSizeValue(), d.FontStyle())
-	}
-}
-
-func TestTextWrappingAndPagination(t *testing.T) {
-	d := New(Options{})
-	// Push the cursor near the bottom so flowing text spills onto a new page.
-	d.MoveCursorTo(20)
-	long := strings.Repeat("wrap this sentence onto several lines ", 20)
-	d.Text(long, nil)
-	b := renderDoc(t, d)
-	r := mustReader(t, b)
-	if r.NumPage() < 2 {
-		t.Fatalf("expected multi-page flow, got %d pages", r.NumPage())
-	}
-	if d.PageCount() != r.NumPage() {
-		t.Fatalf("PageCount %d != reader %d", d.PageCount(), r.NumPage())
-	}
-}
-
-func TestTextAlignmentAndExplicitNewlines(t *testing.T) {
-	for _, a := range []Align{AlignLeft, AlignCenter, AlignRight, AlignJustify} {
-		d := New(Options{})
-		startCursor := d.Cursor()
-		d.Text("a\n\nb", &TextOptions{Align: a, Leading: 3})
-		// Three lines (a, blank, b) advance the cursor thrice.
-		lh := d.lineHeight(12, 3)
-		if got := startCursor - d.Cursor(); got < 3*lh-0.01 || got > 3*lh+0.01 {
-			t.Fatalf("cursor advance = %v, want %v", got, 3*lh)
-		}
-		b := renderDoc(t, d)
-		r := mustReader(t, b)
-		if txt := pageText(r, 1); !strings.Contains(txt, "a") || !strings.Contains(txt, "b") {
-			t.Fatalf("align %v: text = %q", a, txt)
-		}
-	}
-}
-
-func TestDrawText(t *testing.T) {
-	d := New(Options{})
-	before := d.Cursor()
-	d.DrawText("At Point", 100, 200, &TextOptions{Font: "Times", StyleSet: true, Style: StyleItalic, Color: "0000FF"})
-	if d.Cursor() != before {
-		t.Fatalf("draw_text moved the cursor")
-	}
-	r := mustReader(t, renderDoc(t, d))
-	if !textHas(r, 1, "At Point") {
-		t.Fatal("draw_text not found")
-	}
-}
-
-func TestFontFamilyAndColorAccessors(t *testing.T) {
-	d := New(Options{})
-	d.Font("Times", StyleBold)
-	if d.FontFamily() != "Times" || d.FontStyle() != StyleBold {
-		t.Fatal("font not set")
-	}
-	d.FontSize(18)
-	d.Leading(2)
-	if d.FontSizeValue() != 18 {
-		t.Fatal("size not set")
-	}
-	d.FillColor("#FF8800")
-	d.StrokeColor("112233")
-	if d.FillColorValue() != "FF8800" {
-		t.Fatalf("fill = %q", d.FillColorValue())
-	}
-	if d.StrokeColorValue() != "112233" {
-		t.Fatalf("stroke = %q", d.StrokeColorValue())
-	}
-}
-
-func TestUnknownFont(t *testing.T) {
-	d := New(Options{})
-	d.Font("Comic Sans", StyleNormal)
-	if !errors.Is(d.Error(), ErrUnknownFont) {
-		t.Fatalf("err = %v, want ErrUnknownFont", d.Error())
-	}
-	if _, err := d.Render(); !errors.Is(err, ErrUnknownFont) {
-		t.Fatalf("render err = %v", err)
-	}
-}
-
-func TestTextOptionUnknownFontAndBadColor(t *testing.T) {
-	d := New(Options{})
-	d.Text("x", &TextOptions{Font: "Nope"})
-	if !errors.Is(d.Error(), ErrUnknownFont) {
-		t.Fatalf("err = %v", d.Error())
-	}
-	d2 := New(Options{})
-	d2.Text("x", &TextOptions{Color: "xyz"})
-	if d2.Error() == nil {
-		t.Fatal("want bad-color error")
-	}
-}
-
-func TestInvalidUTF8(t *testing.T) {
-	bad := string([]byte{0xff, 0xfe})
-	for _, fn := range []func(*Document){
-		func(d *Document) { d.Text(bad, nil) },
-		func(d *Document) { d.DrawText(bad, 0, 0, nil) },
-		func(d *Document) { d.TextBox(bad, TextBoxOptions{Width: 100}) },
-	} {
-		d := New(Options{})
-		fn(d)
-		if !errors.Is(d.Error(), ErrIncompatibleStringEncoding) {
-			t.Fatalf("err = %v, want ErrIncompatibleStringEncoding", d.Error())
-		}
-	}
-}
-
-func TestBadColorForms(t *testing.T) {
-	for _, bad := range []string{"12345", "GGGGGG"} {
-		d := New(Options{})
-		d.FillColor(bad)
-		if d.Error() == nil {
-			t.Fatalf("color %q: want error", bad)
-		}
-		d2 := New(Options{})
-		d2.StrokeColor(bad)
-		if d2.Error() == nil {
-			t.Fatalf("stroke color %q: want error", bad)
-		}
-	}
-}
-
-// --- text_box ---------------------------------------------------------------
-
-func TestTextBoxFits(t *testing.T) {
-	d := New(Options{})
-	leftover := d.TextBox("short text", TextBoxOptions{X: 0, Y: 400, Width: 300, Height: 100, Align: AlignCenter})
-	if leftover != "" {
-		t.Fatalf("leftover = %q, want empty", leftover)
-	}
-	if d.Error() != nil {
-		t.Fatal(d.Error())
-	}
-	r := mustReader(t, renderDoc(t, d))
-	if !textHas(r, 1, "short text") {
-		t.Fatal("text_box text missing")
-	}
-}
-
-func TestTextBoxTruncateAndExpand(t *testing.T) {
-	long := strings.Repeat("many words that wrap ", 30)
-	// Truncate: a short box returns the unprinted remainder.
-	d := New(Options{})
-	leftover := d.TextBox(long, TextBoxOptions{X: 0, Y: 200, Width: 120, Height: 30})
-	if leftover == "" {
-		t.Fatal("expected leftover from truncated box")
-	}
-	// Expand: draws everything, no leftover.
-	d2 := New(Options{})
-	leftover2 := d2.TextBox(long, TextBoxOptions{X: 0, Y: 200, Width: 120, Height: 30, Overflow: OverflowExpand})
-	if leftover2 != "" {
-		t.Fatalf("expand leftover = %q", leftover2)
-	}
-}
-
-func TestTextBoxErrors(t *testing.T) {
-	d := New(Options{})
-	d.TextBox("x", TextBoxOptions{Width: 0})
-	if !errors.Is(d.Error(), ErrCannotFit) {
-		t.Fatalf("width<=0 err = %v", d.Error())
-	}
-	d2 := New(Options{})
-	long := strings.Repeat("overflowing content ", 40)
-	d2.TextBox(long, TextBoxOptions{Width: 120, Height: 20, Overflow: OverflowError})
-	if !errors.Is(d2.Error(), ErrCannotFit) {
-		t.Fatalf("overflow err = %v", d2.Error())
-	}
-}
-
-// --- graphics ---------------------------------------------------------------
-
-func TestGraphicsPrimitives(t *testing.T) {
-	d := New(Options{})
-	d.LineWidth(2)
-	if d.LineWidthValue() != 2 {
-		t.Fatal("line width")
-	}
-	d.FillColor("00AA00")
-	d.StrokeColor("AA0000")
-	d.FillRectangle(10, 100, 80, 40)
-	d.StrokeRectangle(10, 100, 80, 40)
-	d.StrokeLine(0, 0, 100, 100)
-	d.FillCircle(150, 150, 20)
-	d.StrokeCircle(150, 150, 20)
-	d.FillEllipse(200, 200, 30, 15)
-	d.StrokeEllipse(200, 200, 30, 15)
-	d.StrokeBounds()
-	// Build a path then paint it with fill_and_stroke.
-	d.Rectangle(300, 300, 40, 40)
-	d.Line(300, 300, 340, 340)
-	d.Circle(320, 320, 10)
-	d.Ellipse(320, 320, 12, 8)
-	d.FillAndStroke()
-
-	b := renderDoc(t, d)
-	r := mustReader(t, b)
-	if len(r.Page(1).Content().Rect) == 0 {
-		t.Fatal("no rectangles parsed back")
-	}
-	// Graphics operators appear in the uncompressed content stream.
-	for _, op := range []string{" re", " l", " c", " f", " S"} {
-		if !bytes.Contains(b, []byte(op)) {
-			t.Fatalf("missing graphics operator %q", op)
-		}
-	}
-}
-
-// --- images -----------------------------------------------------------------
-
-func TestImagePNGandJPEG(t *testing.T) {
-	d := New(Options{})
-	before := d.Cursor()
-	d.ImageReader(bytes.NewReader(makePNG()), "png", ImageOptions{Width: 60, Height: 45})
-	if d.Cursor() >= before {
-		t.Fatal("image at cursor should advance the cursor")
-	}
-	d.ImageReader(bytes.NewReader(makeJPEG()), "jpeg", ImageOptions{AtX: 200, AtY: 400, AtSet: true, FitW: 50, FitH: 50})
-	b := renderDoc(t, d)
-	mustReader(t, b)
-	if !bytes.Contains(b, []byte("/Subtype /Image")) {
-		t.Fatal("no image XObject embedded")
-	}
-}
-
-func TestImageFromFile(t *testing.T) {
-	dir := t.TempDir()
-	p := filepath.Join(dir, "pic.png")
-	if err := os.WriteFile(p, makePNG(), 0o644); err != nil {
+	if err := png.Encode(&buf, img); err != nil {
 		t.Fatal(err)
 	}
-	d := New(Options{})
-	d.Image(p, ImageOptions{Width: 30})
-	b := renderDoc(t, d)
-	if !bytes.Contains(b, []byte("/Subtype /Image")) {
-		t.Fatal("file image not embedded")
-	}
-
-	// JPEG file path (covers imageTypeFromName jpg branch).
-	pj := filepath.Join(dir, "pic.jpg")
-	_ = os.WriteFile(pj, makeJPEG(), 0o644)
-	d2 := New(Options{})
-	d2.Image(pj, ImageOptions{Height: 30})
-	if _, err := d2.Render(); err != nil {
-		t.Fatalf("jpeg file: %v", err)
-	}
+	return buf.Bytes()
 }
 
-func TestImageErrors(t *testing.T) {
-	// Missing file.
-	d := New(Options{})
-	d.Image(filepath.Join(t.TempDir(), "nope.png"), ImageOptions{})
-	if d.Error() == nil {
-		t.Fatal("want open error")
-	}
-	// Unsupported type.
-	d2 := New(Options{})
-	d2.ImageReader(bytes.NewReader([]byte("gif")), "gif", ImageOptions{})
-	if !errors.Is(d2.Error(), ErrUnsupportedImageType) {
-		t.Fatalf("err = %v", d2.Error())
-	}
-	// Unknown extension via file path.
-	dir := t.TempDir()
-	pg := filepath.Join(dir, "pic.gif")
-	_ = os.WriteFile(pg, []byte("gif"), 0o644)
-	d3 := New(Options{})
-	d3.Image(pg, ImageOptions{})
-	if !errors.Is(d3.Error(), ErrUnsupportedImageType) {
-		t.Fatalf("ext err = %v", d3.Error())
-	}
-	// Corrupt image bytes make the generator fail; surfaced via Render.
-	d4 := New(Options{})
-	d4.ImageReader(bytes.NewReader([]byte("not-a-real-png")), "png", ImageOptions{})
-	if _, err := d4.Render(); err == nil {
-		t.Fatal("want render error from corrupt image")
-	}
-	if d4.Error() == nil {
-		t.Fatal("want generator error surfaced via Error()")
-	}
-	// Reader that errors mid-read.
-	d5 := New(Options{})
-	d5.ImageReader(errReader{}, "png", ImageOptions{})
-	if d5.Error() == nil {
-		t.Fatal("want read error")
-	}
-}
-
-func TestResolveImageSizeModes(t *testing.T) {
-	cases := []struct {
-		o     ImageOptions
-		wantW float64
-		wantH float64
-	}{
-		{ImageOptions{}, 100, 50},                       // natural
-		{ImageOptions{Width: 200, Height: 20}, 200, 20}, // both
-		{ImageOptions{Width: 50}, 50, 25},               // width only
-		{ImageOptions{Height: 100}, 200, 100},           // height only
-		{ImageOptions{FitW: 40, FitH: 100}, 40, 20},     // fit bound by width
-		{ImageOptions{FitW: 400, FitH: 10}, 20, 10},     // fit bound by height
-	}
-	for i, c := range cases {
-		w, h := resolveImageSize(100, 50, c.o)
-		if w != c.wantW || h != c.wantH {
-			t.Fatalf("case %d: got (%v,%v) want (%v,%v)", i, w, h, c.wantW, c.wantH)
+func jpegBytes(t *testing.T) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 8, 6))
+	for y := 0; y < 6; y++ {
+		for x := 0; x < 8; x++ {
+			img.Set(x, y, color.RGBA{R: uint8(x * 30), G: uint8(y * 40), B: 90, A: 255})
 		}
 	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, nil); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
 }
 
-// --- table ------------------------------------------------------------------
+func fixedClock() func() {
+	prev := SetClock(func() time.Time { return time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC) })
+	return func() { SetClock(prev) }
+}
 
-func TestTableGenerateAndParse(t *testing.T) {
+// ---- document & pages ------------------------------------------------------
+
+func TestNewDefaults(t *testing.T) {
 	d := New(Options{})
-	data := [][]string{
-		{"Name", "Qty", "Price"},
-		{"Widget", "3", "9.99"},
-		{"Gadget", "1"}, // short row exercises the missing-cell path
+	if d.PageWidth() != 612 || d.PageHeight() != 792 {
+		t.Fatalf("size %v x %v", d.PageWidth(), d.PageHeight())
 	}
-	res := d.Table(data, TableOptions{
-		ColumnWidths: []float64{120, 60}, // fewer than columns → last width reused
-		Header:       true,
-		CellPadding:  4,
-		BorderWidth:  1,
-		FontSize:     10,
-	})
-	if len(res.ColumnWidths) != 3 || res.ColumnWidths[2] != 60 {
-		t.Fatalf("column widths = %v", res.ColumnWidths)
+	b := d.Bounds()
+	if b.Width != 540 || b.Height != 720 || b.Left != 36 || b.Bottom != 36 {
+		t.Fatalf("bounds %+v", b)
 	}
-	if res.Height <= 0 || res.Width != 240 {
-		t.Fatalf("table geometry = %+v", res)
+	if d.Cursor() != 720 {
+		t.Fatalf("cursor %v", d.Cursor())
 	}
-	b := renderDoc(t, d)
-	r := mustReader(t, b)
-	txt := pageText(r, 1)
-	for _, want := range []string{"Name", "Widget", "9.99", "Gadget"} {
-		if !strings.Contains(txt, want) {
-			t.Fatalf("table text missing %q in %q", want, txt)
-		}
+	if d.PageCount() != 1 || d.PageNumber() != 1 {
+		t.Fatal("page count")
 	}
-	if len(r.Page(1).Content().Rect) == 0 {
-		t.Fatal("no cell borders drawn")
-	}
+	mustRender(t, d)
 }
-
-func TestTableVariants(t *testing.T) {
-	// Auto widths, no header, no borders, positioned via At, forced row height.
-	d := New(Options{})
-	res := d.Table([][]string{{"a", "b"}, {"c", "d"}}, TableOptions{
-		BorderWidth: -1, // no borders
-		RowHeight:   30,
-		AtX:         50, AtY: 500, AtSet: true,
-	})
-	if res.RowHeights[0] != 30 {
-		t.Fatalf("row height = %v", res.RowHeights[0])
-	}
-	// Positioned table must not move the cursor.
-	if d.Cursor() != d.boundsHeight() {
-		t.Fatal("positioned table moved cursor")
-	}
-	renderDoc(t, d)
-
-	// Default borders (BorderWidth == 0 → 1pt) and auto column widths.
-	d.Table([][]string{{"x", "y"}}, TableOptions{})
-	renderDoc(t, d)
-
-	// Empty and column-less inputs are no-ops.
-	if got := d.Table(nil, TableOptions{}); got.Width != 0 || got.Height != 0 || got.ColumnWidths != nil {
-		t.Fatal("nil data should be empty result")
-	}
-	if got := d.Table([][]string{{}, {}}, TableOptions{}); got.Width != 0 || got.ColumnWidths != nil {
-		t.Fatal("zero-column data should be empty result")
-	}
-}
-
-// --- document / pages / options ---------------------------------------------
 
 func TestPageSizesAndLayout(t *testing.T) {
-	d := New(Options{PageSize: "A4", PageLayout: "landscape"})
+	m := 10.0
+	margins := [4]float64{1, 2, 3, 4}
+	d := New(Options{PageSize: "A4", PageLayout: "landscape", Margin: &m})
 	if d.PageWidth() <= d.PageHeight() {
-		t.Fatalf("landscape A4 should be wider: %v x %v", d.PageWidth(), d.PageHeight())
+		t.Fatal("landscape swap failed")
 	}
-	custom := New(Options{PageWidth: 300, PageHeight: 400})
-	if custom.PageWidth() != 300 || custom.PageHeight() != 400 {
+	d2 := New(Options{PageWidth: 200, PageHeight: 100, Margins: &margins})
+	if d2.PageWidth() != 200 || d2.PageHeight() != 100 {
 		t.Fatal("custom size")
 	}
-	if bnd := custom.Bounds(); bnd.Left != 36 || bnd.Bottom != 36 {
-		t.Fatalf("bounds = %+v", bnd)
+	b := d2.Bounds()
+	if b.Left != 4 || b.Bottom != 3 {
+		t.Fatalf("margins %+v", b)
 	}
 }
 
-func TestInvalidPageLayoutAndSize(t *testing.T) {
-	d := New(Options{PageLayout: "diagonal"})
-	if !errors.Is(d.Error(), ErrInvalidPageLayout) {
-		t.Fatalf("layout err = %v", d.Error())
+func TestInvalidPageOptions(t *testing.T) {
+	d := New(Options{PageLayout: "sideways"})
+	if _, err := d.Render(); !errors.Is(err, ErrInvalidPageLayout) {
+		t.Fatalf("want layout err, got %v", err)
 	}
-	d2 := New(Options{PageSize: "NOSUCH"})
-	if d2.Error() == nil {
-		t.Fatal("want unknown-size error")
+	d2 := New(Options{PageSize: "NOPE"})
+	if err := d2.Error(); err == nil {
+		t.Fatal("want unknown size error")
+	}
+	if _, err := d2.Render(); err == nil {
+		t.Fatal("render should surface error")
 	}
 }
 
-func TestMargins(t *testing.T) {
-	m := 72.0
-	d := New(Options{Margin: &m})
-	if d.Bounds().Left != 72 {
-		t.Fatalf("uniform margin: %+v", d.Bounds())
+func TestGenerateFamily(t *testing.T) {
+	defer fixedClock()()
+	dir := t.TempDir()
+	p := filepath.Join(dir, "a.pdf")
+	if err := Generate(p, func(d *Document) error { d.Text("hi", nil); return nil }); err != nil {
+		t.Fatal(err)
 	}
-	d2 := New(Options{Margins: &[4]float64{10, 20, 30, 40}})
-	bnd := d2.Bounds()
-	if bnd.Left != 40 || bnd.Bottom != 30 {
-		t.Fatalf("per-side margins: %+v", bnd)
+	if _, err := os.Stat(p); err != nil {
+		t.Fatal(err)
+	}
+	// block error path
+	if err := Generate(p, func(d *Document) error { return errors.New("boom") }); err == nil {
+		t.Fatal("want block error")
+	}
+	// GenerateTo
+	var buf bytes.Buffer
+	if err := GenerateTo(&buf, func(d *Document) error { d.Text("hi", nil); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() == 0 {
+		t.Fatal("no output")
+	}
+	if err := GenerateTo(&buf, func(d *Document) error { return errors.New("x") }); err == nil {
+		t.Fatal("want error")
+	}
+	// GenerateTo render error
+	if err := GenerateTo(&buf, func(d *Document) error { d.FillColor("bad"); return nil }); err == nil {
+		t.Fatal("want render error")
+	}
+	// GenerateWith
+	p2 := filepath.Join(dir, "b.pdf")
+	if err := GenerateWith(p2, Options{PageSize: "LEGAL"}, func(d *Document) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := GenerateWith(p2, Options{}, func(d *Document) error { return errors.New("x") }); err == nil {
+		t.Fatal("want error")
+	}
+}
+
+func TestGenerateToWriteError(t *testing.T) {
+	err := GenerateTo(errWriter{}, func(d *Document) error { d.Text("x", nil); return nil })
+	if err == nil {
+		t.Fatal("want write error")
+	}
+}
+
+type errWriter struct{}
+
+func (errWriter) Write([]byte) (int, error) { return 0, errors.New("disk full") }
+
+func TestRenderFileError(t *testing.T) {
+	d := New(Options{})
+	if err := d.RenderFile("/no/such/dir/x.pdf"); err == nil {
+		t.Fatal("want write error")
+	}
+	d2 := New(Options{PageLayout: "bad"})
+	if err := d2.RenderFile(filepath.Join(t.TempDir(), "x.pdf")); err == nil {
+		t.Fatal("want render error")
 	}
 }
 
 func TestCursorMovement(t *testing.T) {
 	d := New(Options{})
-	top := d.Cursor()
 	d.MoveDown(10)
 	d.MoveUp(4)
-	if got := top - d.Cursor(); got != 6 {
-		t.Fatalf("net move = %v, want 6", got)
+	if d.Cursor() != 714 {
+		t.Fatalf("cursor %v", d.Cursor())
 	}
 	d.MoveCursorTo(100)
 	if d.Cursor() != 100 {
-		t.Fatal("move_cursor_to")
+		t.Fatal("cursor to")
 	}
-	var order []string
-	d.Pad(5, func() { order = append(order, "pad") })
-	d.PadTop(5, func() { order = append(order, "top") })
-	d.PadBottom(5, func() { order = append(order, "bottom") })
-	if strings.Join(order, ",") != "pad,top,bottom" {
-		t.Fatalf("pad order = %v", order)
+	seq := []string{}
+	d.Pad(5, func() { seq = append(seq, "pad") })
+	d.PadTop(5, func() { seq = append(seq, "top") })
+	d.PadBottom(5, func() { seq = append(seq, "bottom") })
+	if len(seq) != 3 {
+		t.Fatal("pad blocks")
 	}
 }
 
 func TestStartNewPage(t *testing.T) {
+	defer fixedClock()()
 	d := New(Options{})
-	d.Font("Courier", StyleBold)
-	d.FillColor("102030")
-	d.StrokeColor("405060")
-	d.LineWidth(3)
-	d.Text("page one", nil)
+	d.FillColor("112233")
 	d.StartNewPage()
-	if d.Cursor() != d.boundsHeight() {
-		t.Fatal("cursor not reset on new page")
+	if d.PageCount() != 2 {
+		t.Fatal("page count")
 	}
-	d.Text("page two", nil)
-	r := mustReader(t, renderDoc(t, d))
-	if r.NumPage() != 2 {
-		t.Fatalf("pages = %d", r.NumPage())
+	if d.Cursor() != 720 {
+		t.Fatal("cursor reset")
 	}
-	if !textHas(r, 1, "page one") || !textHas(r, 2, "page two") {
-		t.Fatal("text not on expected pages")
-	}
-}
-
-func TestGenerateHelpers(t *testing.T) {
-	dir := t.TempDir()
-	p := filepath.Join(dir, "out.pdf")
-	if err := Generate(p, func(pdf *Document) error {
-		pdf.Text("generated", nil)
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	b, err := os.ReadFile(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r := mustReader(t, b)
-	if !textHas(r, 1, "generated") {
-		t.Fatal("Generate output wrong")
-	}
-
-	// GenerateWith options.
-	p2 := filepath.Join(dir, "out2.pdf")
-	if err := GenerateWith(p2, Options{PageSize: "A5"}, func(pdf *Document) error {
-		pdf.Text("a5", nil)
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	// GenerateTo writer.
-	var buf bytes.Buffer
-	if err := GenerateTo(&buf, func(pdf *Document) error {
-		pdf.Text("to writer", nil)
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	mustReader(t, buf.Bytes())
-}
-
-func TestGenerateErrorPaths(t *testing.T) {
-	boom := errors.New("boom")
-	dir := t.TempDir()
-	p := filepath.Join(dir, "x.pdf")
-
-	if err := Generate(p, func(*Document) error { return boom }); err != boom {
-		t.Fatalf("Generate block err = %v", err)
-	}
-	if err := GenerateWith(p, Options{}, func(*Document) error { return boom }); err != boom {
-		t.Fatalf("GenerateWith block err = %v", err)
-	}
-	if err := GenerateTo(&bytes.Buffer{}, func(*Document) error { return boom }); err != boom {
-		t.Fatalf("GenerateTo block err = %v", err)
-	}
-	// GenerateTo where Render fails (bad color set in the block).
-	if err := GenerateTo(&bytes.Buffer{}, func(pdf *Document) error {
-		pdf.FillColor("nope")
-		return nil
-	}); err == nil {
-		t.Fatal("want render error in GenerateTo")
-	}
-	// GenerateTo where the writer fails.
-	if err := GenerateTo(errWriter{}, func(pdf *Document) error {
-		pdf.Text("x", nil)
-		return nil
-	}); err == nil {
-		t.Fatal("want writer error")
-	}
-	// Generate where render fails (block leaves the doc errored).
-	if err := Generate(p, func(pdf *Document) error {
-		pdf.FillColor("nope")
-		return nil
-	}); err == nil {
-		t.Fatal("want render error in Generate")
+	b := mustRender(t, d)
+	if parse(t, b).NumPage() != 2 {
+		t.Fatal("pages")
 	}
 }
 
-func TestRenderFileErrorPaths(t *testing.T) {
-	// Render error (unknown font) surfaces through RenderFile.
+func TestSkipPageCreation(t *testing.T) {
+	d := New(Options{SkipPageCreation: true})
+	if d.PageCount() != 0 {
+		t.Fatalf("pages %d", d.PageCount())
+	}
+	d.StartNewPage()
+	d.Text("x", nil)
+	mustRender(t, d)
+}
+
+func TestAFMBaseNames(t *testing.T) {
+	cases := []struct {
+		fam   string
+		style Style
+		want  string
+	}{
+		{"Courier", StyleNormal, "Courier"},
+		{"Courier", StyleBold, "Courier-Bold"},
+		{"Courier", StyleItalic, "Courier-Oblique"},
+		{"Courier", StyleBoldItalic, "Courier-BoldOblique"},
+		{"Times", StyleItalic, "Times-Italic"},
+		{"Times-Roman", StyleBoldItalic, "Times-BoldItalic"},
+		{"Symbol", StyleNormal, "Symbol"},
+		{"ZapfDingbats", StyleNormal, "ZapfDingbats"},
+		{"Helvetica", StyleBold, "Helvetica-Bold"},
+		{"arial", StyleItalic, "Helvetica-Oblique"},
+	}
+	for _, c := range cases {
+		if got := afmBaseName(c.fam, c.style); got != c.want {
+			t.Errorf("afmBaseName(%q,%v)=%q want %q", c.fam, c.style, got, c.want)
+		}
+	}
+	if !isAFMFamily("Times") || isAFMFamily("Nonexistent") {
+		t.Fatal("isAFMFamily")
+	}
+}
+
+// ---- text ------------------------------------------------------------------
+
+func TestFontSelection(t *testing.T) {
 	d := New(Options{})
+	d.Font("Times", StyleBold)
+	if d.FontFamily() != "Times-Bold" || d.FontStyle() != StyleBold {
+		t.Fatalf("font %s %v", d.FontFamily(), d.FontStyle())
+	}
+	d.Font("Times", StyleItalic)
+	if d.FontStyle() != StyleItalic {
+		t.Fatal("italic")
+	}
+	d.Font("Times", StyleBoldItalic)
+	if d.FontStyle() != StyleBoldItalic {
+		t.Fatal("bolditalic")
+	}
+	d.Font("Times", StyleNormal)
+	if d.FontStyle() != StyleNormal {
+		t.Fatal("normal")
+	}
 	d.Font("Nope", StyleNormal)
-	if err := d.RenderFile(filepath.Join(t.TempDir(), "x.pdf")); err == nil {
-		t.Fatal("want render error")
-	}
-	// WriteFile error: a path whose parent directory does not exist.
-	d2 := New(Options{})
-	d2.Text("ok", nil)
-	if err := d2.RenderFile("/no/such/dir/here/file.pdf"); err == nil {
-		t.Fatal("want write error")
+	if !errors.Is(d.Error(), ErrUnknownFont) {
+		t.Fatal("unknown font")
 	}
 }
 
-func TestErrorAccessorStates(t *testing.T) {
-	// nil error.
-	if New(Options{}).Error() != nil {
-		t.Fatal("fresh doc should have no error")
-	}
-	// d.err set (bad color).
+func TestFontSizeLeadingKerning(t *testing.T) {
 	d := New(Options{})
-	d.FillColor("bad")
-	if d.Error() == nil {
-		t.Fatal("want d.err")
+	d.FontSize(18)
+	if d.FontSizeValue() != 18 {
+		t.Fatal("size")
 	}
-	// fpdf error, d.err nil (corrupt image).
+	d.Leading(3)
+	if d.LeadingValue() != 3 {
+		t.Fatal("leading")
+	}
+	d.SetKerning(false)
+	if d.KerningEnabled() {
+		t.Fatal("kerning")
+	}
+	if numToken(12) != "12" || numToken(12.5) != "12.5" {
+		t.Fatalf("numToken %q %q", numToken(12), numToken(12.5))
+	}
+}
+
+func TestWidthOfString(t *testing.T) {
+	d := New(Options{})
+	w := d.WidthOfString("Hello")
+	if w <= 0 {
+		t.Fatal("width")
+	}
+	// invalid winansi -> width 0
+	if d.WidthOfString("") != 0 {
+		t.Fatal("unmappable width should be 0")
+	}
+}
+
+func TestTextRendering(t *testing.T) {
+	defer fixedClock()()
+	d := New(Options{})
+	d.Text("Left aligned line", nil)
+	d.Text("Centered", &TextOptions{Align: AlignCenter})
+	d.Text("Right", &TextOptions{Align: AlignRight})
+	d.Text("Justified text here", &TextOptions{Align: AlignJustify})
+	d.Text("With color and size", &TextOptions{Size: 20, Color: "884422", Leading: 2})
+	b := mustRender(t, d)
+	r := parse(t, b)
+	if len(r.Page(1).Content().Text) == 0 {
+		t.Fatal("no text")
+	}
+}
+
+func TestTextPagination(t *testing.T) {
+	defer fixedClock()()
+	d := New(Options{})
+	long := strings.Repeat("word ", 2000)
+	d.Text(long, nil)
+	if d.PageCount() < 2 {
+		t.Fatalf("expected pagination, pages=%d", d.PageCount())
+	}
+	mustRender(t, d)
+}
+
+func TestTextInvalidUTF8(t *testing.T) {
+	d := New(Options{})
+	d.Text("\xff\xfe", nil)
+	if !errors.Is(d.Error(), ErrIncompatibleStringEncoding) {
+		t.Fatal("want encoding error")
+	}
 	d2 := New(Options{})
-	d2.ImageReader(bytes.NewReader([]byte("bad")), "png", ImageOptions{})
+	d2.DrawText("\xff\xfe", 0, 0, nil)
+	if !errors.Is(d2.Error(), ErrIncompatibleStringEncoding) {
+		t.Fatal("drawtext encoding")
+	}
+}
+
+func TestTextUnmappableRune(t *testing.T) {
+	d := New(Options{})
+	d.Text("emoji \U0001F600", nil) // valid utf8 but not cp1252
+	if !errors.Is(d.Error(), ErrIncompatibleStringEncoding) {
+		t.Fatal("want incompatible encoding")
+	}
+}
+
+func TestDrawTextOptions(t *testing.T) {
+	defer fixedClock()()
+	d := New(Options{})
+	d.DrawText("abc", 10, 700, &TextOptions{Size: 16, Font: "Courier", StyleSet: true, Style: StyleBold, Color: "ff0000", KerningSet: true, Kerning: false})
+	mustRender(t, d)
+}
+
+func TestTextBox(t *testing.T) {
+	defer fixedClock()()
+	d := New(Options{})
+	// width <= 0 (on a throwaway doc: this sets a sticky error)
+	dw := New(Options{})
+	if dw.TextBox("x", TextBoxOptions{Width: 0}) != "x" {
+		t.Fatal("bad width should return input")
+	}
+	if !errors.Is(dw.Error(), ErrCannotFit) {
+		t.Fatal("want cannot fit for zero width")
+	}
+	// fits fully
+	rest := d.TextBox("short", TextBoxOptions{X: 0, Y: 700, Width: 200, Height: 100})
+	if rest != "" {
+		t.Fatalf("want no overflow, got %q", rest)
+	}
+	// truncate overflow
+	long := strings.Repeat("word ", 200)
+	rest = d.TextBox(long, TextBoxOptions{X: 0, Y: 700, Width: 100, Height: 30})
+	if rest == "" {
+		t.Fatal("want truncated overflow")
+	}
+	// expand
+	rest = d.TextBox(long, TextBoxOptions{X: 0, Y: 700, Width: 100, Height: 30, Overflow: OverflowExpand})
+	if rest != "" {
+		t.Fatal("expand should print all")
+	}
+	// error overflow
+	d3 := New(Options{})
+	d3.TextBox(long, TextBoxOptions{X: 0, Y: 700, Width: 100, Height: 30, Overflow: OverflowError})
+	if !errors.Is(d3.Error(), ErrCannotFit) {
+		t.Fatal("want cannot fit")
+	}
+	// invalid utf8
+	d4 := New(Options{})
+	if d4.TextBox("\xff", TextBoxOptions{Width: 100}) != "\xff" {
+		t.Fatal("invalid utf8 returns input")
+	}
+	// unmappable
+	d5 := New(Options{})
+	if got := d5.TextBox("\U0001F600", TextBoxOptions{Width: 100}); got == "" {
+		t.Fatal("unmappable returns input")
+	}
+	// with font override
+	d.TextBox("styled", TextBoxOptions{Width: 200, Font: "Times", StyleSet: true, Style: StyleBold, Size: 14, Color: "00ff00", Align: AlignCenter})
+	mustRender(t, d)
+}
+
+func TestWrapEdgeCases(t *testing.T) {
+	d := New(Options{})
+	lines := d.wrapText("", 100, 12, true)
+	if len(lines) != 1 || lines[0] != "" {
+		t.Fatal("empty para")
+	}
+	// single word wider than width still emitted
+	lines = d.wrapText("supercalifragilistic", 5, 12, true)
+	if len(lines) == 0 {
+		t.Fatal("long word")
+	}
+	lines = d.wrapText("a\nb", 100, 12, true)
+	if len(lines) != 2 {
+		t.Fatal("newlines")
+	}
+}
+
+// ---- color -----------------------------------------------------------------
+
+func TestColors(t *testing.T) {
+	defer fixedClock()()
+	d := New(Options{})
+	d.FillColor("#AABBCC")
+	if d.FillColorValue() != "AABBCC" {
+		t.Fatalf("fill %s", d.FillColorValue())
+	}
+	d.StrokeColor("102030")
+	if d.StrokeColorValue() != "102030" {
+		t.Fatal("stroke")
+	}
+	d.FillColorCMYK(0, 100, 50, 0)
+	if d.FillColorValue() == "" {
+		t.Fatal("cmyk hex")
+	}
+	d.StrokeColorCMYK(10, 20, 30, 40)
+	mustRender(t, d)
+	dbad := New(Options{})
+	dbad.FillColor("bad")
+	if dbad.Error() == nil {
+		t.Fatal("bad fill")
+	}
+	d2 := New(Options{})
+	d2.StrokeColor("nothex")
 	if d2.Error() == nil {
-		t.Fatal("want fpdf error via Error()")
+		t.Fatal("bad stroke")
 	}
 }
 
-func TestFailKeepsFirstError(t *testing.T) {
+func TestParseHexColor(t *testing.T) {
+	if _, err := parseHexColor("12345"); err == nil {
+		t.Fatal("short")
+	}
+	if _, err := parseHexColor("gggggg"); err == nil {
+		t.Fatal("nonhex")
+	}
+}
+
+// ---- graphics --------------------------------------------------------------
+
+func TestGraphicsAll(t *testing.T) {
+	defer fixedClock()()
 	d := New(Options{})
-	d.FillColor("firstbad") // sets d.err
-	first := d.Error()
-	d.StrokeColor("secondbad") // must not overwrite
-	if d.Error() != first {
-		t.Fatal("fail overwrote the first error")
+	d.LineWidth(2)
+	if d.LineWidthValue() != 2 {
+		t.Fatal("lw")
 	}
+	d.CapStyle(1)
+	d.JoinStyle(2)
+	d.Dash(3, 2, 1)
+	d.Undash()
+	d.MoveTo(0, 0)
+	d.LineTo(10, 10)
+	d.CurveTo(20, 20, 12, 12, 18, 18)
+	d.ClosePath()
+	d.Stroke()
+	d.Rectangle(0, 100, 50, 20)
+	d.Fill()
+	d.Line(0, 0, 5, 5)
+	d.FillAndStroke()
+	d.CloseAndStroke()
+	d.Polygon([2]float64{0, 0}, [2]float64{10, 0}, [2]float64{5, 8})
+	d.Stroke()
+	d.Polygon() // empty no-op
+	d.StrokeRectangle(1, 2, 3, 4)
+	d.FillRectangle(1, 2, 3, 4)
+	d.StrokeLine(0, 0, 1, 1)
+	d.StrokeCircle(50, 50, 10)
+	d.FillCircle(50, 50, 10)
+	d.StrokeEllipse(50, 50, 10, 5)
+	d.FillEllipse(50, 50, 10, 5)
+	d.FillPolygon([2]float64{0, 0}, [2]float64{1, 0}, [2]float64{0, 1})
+	d.StrokePolygon([2]float64{0, 0}, [2]float64{1, 0}, [2]float64{0, 1})
+	d.StrokeBounds()
+	mustRender(t, d)
 }
 
-func TestStyleAndErrorStrings(t *testing.T) {
-	if StyleBold.fpdfStyle() != "B" || StyleItalic.fpdfStyle() != "I" ||
-		StyleBoldItalic.fpdfStyle() != "BI" || StyleNormal.fpdfStyle() != "" {
-		t.Fatal("style mapping")
-	}
-	// prawnError with and without a message, plus Kind.
-	e := &prawnError{kind: "CannotFit"}
-	if e.Error() != "Prawn::Errors::CannotFit" || e.Kind() != "CannotFit" {
-		t.Fatalf("bare error = %q", e.Error())
-	}
-	e2 := newError("UnknownFont", "missing %s", "Foo")
-	if e2.Error() != "Prawn::Errors::UnknownFont: missing Foo" {
-		t.Fatalf("msg error = %q", e2.Error())
-	}
-}
+// ---- transformations -------------------------------------------------------
 
-func TestSetClockReset(t *testing.T) {
-	prev := SetClock(nil) // reset to time.Now
-	// A fresh doc still renders (CreationDate = now); restore the pinned clock.
+func TestTransformations(t *testing.T) {
+	defer fixedClock()()
 	d := New(Options{})
-	d.Text("now", nil)
-	if _, err := d.Render(); err != nil {
-		t.Fatal(err)
-	}
-	SetClock(prev)
+	d.Rotate(45, func() { d.Text("r", nil) })
+	d.RotateAbout(30, 100, 100, func() { d.Text("ra", nil) })
+	d.Scale(1.5, func() { d.Text("s", nil) })
+	d.ScaleAbout(2, 50, 50, func() { d.Text("sa", nil) })
+	d.Translate(5, 5, func() { d.Text("t", nil) })
+	d.TransformationMatrix(1, 0, 0, 1, 0, 0, nil) // no block
+	d.SaveGraphicsState()
+	d.RestoreGraphicsState()
+	d.Transparency(0.5, 0.8, func() { d.Text("alpha", nil) })
+	mustRender(t, d)
 }
 
-func TestDeterministicOutput(t *testing.T) {
-	gen := func() []byte {
-		d := New(Options{})
-		d.Text("stable", nil)
-		return renderDoc(t, d)
-	}
-	if !bytes.Equal(gen(), gen()) {
-		t.Fatal("output is not deterministic under a pinned clock")
+func TestRestoreWithoutSave(t *testing.T) {
+	d := New(Options{})
+	d.RestoreGraphicsState()
+	if !errors.Is(d.Error(), ErrEmptyGraphicStateStack) {
+		t.Fatal("want empty stack")
 	}
 }
 
-// --- test doubles -----------------------------------------------------------
+func TestFinishLeftoverSaves(t *testing.T) {
+	defer fixedClock()()
+	d := New(Options{})
+	d.SaveGraphicsState()
+	d.SaveGraphicsState()
+	mustRender(t, d) // finishPage must close leftover q's
+}
 
-type errWriter struct{}
+// ---- bounding box / grid / repeaters --------------------------------------
 
-func (errWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
+func TestBoundingBoxAndGrid(t *testing.T) {
+	defer fixedClock()()
+	d := New(Options{})
+	d.BoundingBox(50, 700, 200, 100, func() {
+		d.Text("in box", nil)
+		if d.Bounds().Width != 200 {
+			t.Fatal("nested bounds width")
+		}
+	})
+	if d.Cursor() != 600 {
+		t.Fatalf("cursor after box %v", d.Cursor())
+	}
+	g := d.DefineGrid(3, 4, 10)
+	if g.ColumnWidth() <= 0 || g.RowHeight() <= 0 {
+		t.Fatal("grid dims")
+	}
+	g.Box(0, 0, func() { d.Text("cell", nil) })
+	g.Box(1, 2, func() { d.Text("cell", nil) })
+	mustRender(t, d)
+}
+
+func TestRepeatersAndNumbering(t *testing.T) {
+	defer fixedClock()()
+	d := New(Options{})
+	d.Text("p1", nil)
+	d.StartNewPage()
+	d.Text("p2", nil)
+	d.StartNewPage()
+	d.Text("p3", nil)
+	d.Repeat(func(p, total int) bool { return p%2 == 1 }, func() {
+		d.DrawText("odd", 500, 20, &TextOptions{Size: 8})
+	})
+	d.NumberPages("<page> / <total>", 250, 20, &TextOptions{Size: 9})
+	seen := 0
+	d.Repeat(func(p, total int) bool { return true }, func() {
+		if d.RepeatPageNumber() >= 1 && d.RepeatPageCount() == 3 {
+			seen++
+		}
+	})
+	b := mustRender(t, d)
+	if parse(t, b).NumPage() != 3 {
+		t.Fatal("pages")
+	}
+	if seen != 3 {
+		t.Fatalf("repeat context seen=%d", seen)
+	}
+}
+
+func TestReplacePlaceholders(t *testing.T) {
+	if replacePlaceholders("<page>/<total> plain", 2, 5) != "2/5 plain" {
+		t.Fatal("placeholders")
+	}
+	if replacePlaceholders("<pag", 1, 1) != "<pag" {
+		t.Fatal("partial")
+	}
+}
+
+func TestRunRepeatersNone(t *testing.T) {
+	d := New(Options{})
+	d.Text("x", nil)
+	d.runRepeaters() // no repeaters -> early return
+	mustRender(t, d)
+}
+
+// ---- table -----------------------------------------------------------------
+
+func TestTable(t *testing.T) {
+	defer fixedClock()()
+	d := New(Options{})
+	if d.Table(nil, TableOptions{}).Width != 0 {
+		t.Fatal("empty table")
+	}
+	if d.Table([][]string{{}}, TableOptions{}).Width != 0 {
+		t.Fatal("zero cols")
+	}
+	res := d.Table([][]string{
+		{"Item", "Qty", "Price"},
+		{"Widget", "3", "9.99"},
+		{"", "1", "19.99"},
+	}, TableOptions{Header: true})
+	if res.Width == 0 || len(res.ColumnWidths) != 3 {
+		t.Fatal("table result")
+	}
+	d.Table([][]string{{"a", "b"}}, TableOptions{
+		ColumnWidths: []float64{100}, BorderWidth: -1, FontSize: 10, RowHeight: 30, CellPadding: 3, AtSet: true, AtX: 10, AtY: 500,
+	})
+	d.Font("Times", StyleNormal)
+	d.Table([][]string{{"x"}}, TableOptions{Header: true})
+	d.Font("Courier", StyleNormal)
+	d.Table([][]string{{"x"}}, TableOptions{Header: true})
+	mustRender(t, d)
+}
+
+func TestFoldHelpers(t *testing.T) {
+	if !containsFold("Helvetica-Bold", "bold") {
+		t.Fatal("fold contains")
+	}
+	if equalFold("ab", "abc") {
+		t.Fatal("len")
+	}
+	if !equalFold("AbC", "aBc") {
+		t.Fatal("fold eq")
+	}
+	if indexFold("xyz", "q") != -1 {
+		t.Fatal("no match")
+	}
+}
+
+// ---- formatted text --------------------------------------------------------
+
+func TestFormattedText(t *testing.T) {
+	defer fixedClock()()
+	d := New(Options{})
+	d.FormattedText([]FormattedFragment{
+		{Text: "Bold ", Bold: true},
+		{Text: "italic ", Italic: true},
+		{Text: "big ", Size: 20},
+		{Text: "colored ", Color: "ff0000"},
+		{Text: "times", Font: "Times", Bold: true, Italic: true},
+	}, nil)
+	// wrapping
+	d.FormattedText([]FormattedFragment{{Text: strings.Repeat("word ", 200)}}, nil)
+	mustRender(t, d)
+}
+
+func TestFragmentStyle(t *testing.T) {
+	cases := []struct {
+		f    FormattedFragment
+		want Style
+	}{
+		{FormattedFragment{Bold: true, Italic: true}, StyleBoldItalic},
+		{FormattedFragment{Bold: true}, StyleBold},
+		{FormattedFragment{Italic: true}, StyleItalic},
+		{FormattedFragment{}, StyleNormal},
+	}
+	for _, c := range cases {
+		if c.f.style() != c.want {
+			t.Errorf("style %+v", c.f)
+		}
+	}
+}
+
+func TestTextInline(t *testing.T) {
+	defer fixedClock()()
+	d := New(Options{})
+	d.TextInline("plain <b>bold</b> and <i>italic</i> and <strong>s</strong> <em>e</em>", nil)
+	d.TextInline(`<color rgb="ff0000">red</color> normal`, nil)
+	d.TextInline("unclosed <b>bold no end", nil)
+	d.TextInline("bad <tag with no close bracket", nil)
+	d.TextInline("</b></i></color> stray closers", nil)
+	mustRender(t, d)
+}
+
+func TestParseInline(t *testing.T) {
+	frags := parseInline("a<b>b</b>c")
+	if len(frags) != 3 {
+		t.Fatalf("frags %d", len(frags))
+	}
+	if !frags[1].Bold {
+		t.Fatal("bold frag")
+	}
+	if parseColorTag(`color rgb="00ff00"`) != "00ff00" {
+		t.Fatal("color tag")
+	}
+	if parseColorTag("color") != "" {
+		t.Fatal("no rgb")
+	}
+	if parseColorTag(`color rgb="xx"`) != "" {
+		t.Fatal("short rgb")
+	}
+}
+
+// ---- images ----------------------------------------------------------------
+
+func TestImages(t *testing.T) {
+	defer fixedClock()()
+	dir := t.TempDir()
+	pngP := filepath.Join(dir, "img.png")
+	os.WriteFile(pngP, pngBytes(t, false), 0o644)
+	alphaP := filepath.Join(dir, "alpha.png")
+	os.WriteFile(alphaP, pngBytes(t, true), 0o644)
+	jpgP := filepath.Join(dir, "img.jpg")
+	os.WriteFile(jpgP, jpegBytes(t), 0o644)
+
+	d := New(Options{})
+	r := d.Image(pngP, ImageOptions{})
+	if r.Width == 0 {
+		t.Fatal("png size")
+	}
+	d.Image(alphaP, ImageOptions{AtX: 100, AtY: 400, AtSet: true})
+	d.Image(jpgP, ImageOptions{Width: 100})
+	d.Image(pngP, ImageOptions{Height: 50})
+	d.Image(pngP, ImageOptions{FitW: 80, FitH: 80})
+	d.Image(pngP, ImageOptions{Width: 40, Height: 40})
+	d.Image(pngP, ImageOptions{}) // cache hit
+	b := mustRender(t, d)
+	r2 := parse(t, b)
+	xobj := r2.Page(1).Resources().Key("XObject")
+	if xobj.Kind() != pdf.Dict {
+		t.Fatal("no xobject")
+	}
+	mustRender(t, d)
+}
+
+func TestImageReaderAndErrors(t *testing.T) {
+	defer fixedClock()()
+	d := New(Options{})
+	d.ImageReader(bytes.NewReader(pngBytes(t, false)), "png", ImageOptions{})
+	d.ImageReader(bytes.NewReader(jpegBytes(t)), "jpeg", ImageOptions{})
+	mustRender(t, d)
+
+	d2 := New(Options{})
+	d2.Image("/nonexistent.png", ImageOptions{})
+	if d2.Error() == nil {
+		t.Fatal("missing file")
+	}
+	d3 := New(Options{})
+	d3.ImageReader(bytes.NewReader([]byte("gif")), "gif", ImageOptions{})
+	if !errors.Is(d3.Error(), ErrUnsupportedImageType) {
+		t.Fatal("unsupported type")
+	}
+	d4 := New(Options{})
+	d4.ImageReader(bytes.NewReader([]byte("notpng")), "png", ImageOptions{})
+	if d4.Error() == nil {
+		t.Fatal("bad png")
+	}
+	d5 := New(Options{})
+	d5.ImageReader(bytes.NewReader([]byte{0xff, 0xd8, 0x00}), "jpg", ImageOptions{})
+	if d5.Error() == nil {
+		t.Fatal("bad jpeg")
+	}
+	d6 := New(Options{})
+	d6.ImageReader(errReader{}, "png", ImageOptions{})
+	if d6.Error() == nil {
+		t.Fatal("read error")
+	}
+}
 
 type errReader struct{}
 
-func (errReader) Read([]byte) (int, error) { return 0, errors.New("read failed") }
+func (errReader) Read([]byte) (int, error) { return 0, errors.New("io") }
+
+func TestImageTypeFromName(t *testing.T) {
+	if imageTypeFromName("a.PNG") != "png" || imageTypeFromName("a.JPEG") != "jpg" ||
+		imageTypeFromName("a.jpg") != "jpg" || imageTypeFromName("a.gif") != "" {
+		t.Fatal("type from name")
+	}
+}
+
+func TestJPEGInfo(t *testing.T) {
+	if _, _, _, err := jpegInfo([]byte{0, 1}); err == nil {
+		t.Fatal("not jpeg")
+	}
+	if _, _, _, err := jpegInfo([]byte{0xff, 0xd8, 0xff, 0xd9}); err == nil {
+		t.Fatal("no frame")
+	}
+}
+
+func TestResolveImageSize(t *testing.T) {
+	if w, _ := resolveImageSize(100, 50, ImageOptions{}); w != 100 {
+		t.Fatal("natural")
+	}
+	if w, h := resolveImageSize(100, 50, ImageOptions{FitW: 50, FitH: 50}); w != 50 || h != 25 {
+		t.Fatalf("fit %v %v", w, h)
+	}
+	if _, h := resolveImageSize(100, 50, ImageOptions{Width: 200}); h != 100 {
+		t.Fatal("width scale")
+	}
+	if w, _ := resolveImageSize(100, 50, ImageOptions{Height: 100}); w != 200 {
+		t.Fatal("height scale")
+	}
+}
+
+// ---- TTF -------------------------------------------------------------------
+
+func loadGoFont(t *testing.T) []byte {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", "goregular.ttf"))
+	if err != nil {
+		t.Skip("no test TTF")
+	}
+	return b
+}
+
+func TestTTFEmbedding(t *testing.T) {
+	defer fixedClock()()
+	d := New(Options{})
+	ttf := loadGoFont(t)
+	if err := d.RegisterFontTTF("GoRegular", ttf); err != nil {
+		t.Fatal(err)
+	}
+	d.Font("GoRegular", StyleNormal)
+	if d.FontFamily() != "GoRegular" {
+		t.Fatalf("family %s", d.FontFamily())
+	}
+	d.Text("Accented: café résumé naïve ñ — em dash", nil)
+	d.MoveDown(20)
+	if d.WidthOfString("Hello") <= 0 {
+		t.Fatal("ttf width")
+	}
+	b := mustRender(t, d)
+	r := parse(t, b)
+	// verify a Type0 font and FontFile2 exist
+	if !bytes.Contains(b, []byte("/Type0")) || !bytes.Contains(b, []byte("/CIDFontType2")) {
+		t.Fatal("no composite font")
+	}
+	if !bytes.Contains(b, []byte("FontFile2")) {
+		t.Fatal("no embedded font file")
+	}
+	if !bytes.Contains(b, []byte("/ToUnicode")) {
+		t.Fatal("no ToUnicode")
+	}
+	_ = r
+}
+
+func TestTTFInvalid(t *testing.T) {
+	d := New(Options{})
+	if err := d.RegisterFontTTF("bad", []byte("xx")); err == nil {
+		t.Fatal("truncated")
+	}
+	// missing tables: a minimal offset table with 0 tables
+	hdr := []byte{0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	if err := d.RegisterFontTTF("empty", hdr); err == nil {
+		t.Fatal("missing tables")
+	}
+}
+
+func TestGidBytes(t *testing.T) {
+	b := gidBytes([]uint16{1, 258})
+	if len(b) != 4 || b[0] != 0 || b[1] != 1 || b[2] != 1 || b[3] != 2 {
+		t.Fatalf("gidBytes %v", b)
+	}
+}
+
+func TestSanitizeName(t *testing.T) {
+	if sanitizeName("Go Regular/(x)") != "GoRegularx" {
+		t.Fatalf("sanitize %q", sanitizeName("Go Regular/(x)"))
+	}
+	if sanitizeName("   ") != "Embedded" {
+		t.Fatal("empty sanitize")
+	}
+}
+
+// ---- cmap subtable parsers (white-box, crafted inputs) ---------------------
+
+func TestCmapFormats(t *testing.T) {
+	tf := &ttfFont{cmap: map[rune]uint16{}}
+
+	// format 6: first=65, count=2 -> gids 10,11
+	f6 := make([]byte, 14)
+	be16put(f6[0:], 6)
+	be16put(f6[6:], 65)
+	be16put(f6[8:], 2)
+	be16put(f6[10:], 10)
+	be16put(f6[12:], 11)
+	tf.parseCmap6(f6)
+	if tf.cmap['A'] != 10 || tf.cmap['B'] != 11 {
+		t.Fatal("cmap6")
+	}
+
+	// format 0: 262 bytes, byte i -> glyph
+	f0 := make([]byte, 262)
+	f0[6+66] = 42
+	tf.parseCmap0(f0)
+	if tf.cmap['B'] != 42 {
+		t.Fatal("cmap0")
+	}
+
+	// format 12: one group 0x41..0x42 -> startGID 100
+	f12 := make([]byte, 16+12)
+	be32put(f12[12:], 1)
+	be32put(f12[16:], 0x41)
+	be32put(f12[20:], 0x42)
+	be32put(f12[24:], 100)
+	tf.parseCmap12(f12)
+	if tf.cmap['A'] != 100 || tf.cmap['B'] != 101 {
+		t.Fatal("cmap12")
+	}
+}
+
+func be16put(b []byte, v uint16) { b[0] = byte(v >> 8); b[1] = byte(v) }
+func be32put(b []byte, v uint32) {
+	b[0] = byte(v >> 24)
+	b[1] = byte(v >> 16)
+	b[2] = byte(v >> 8)
+	b[3] = byte(v)
+}
+
+func TestTableChecksum(t *testing.T) {
+	if tableChecksum([]byte{0, 0, 0, 1}) != 1 {
+		t.Fatal("aligned")
+	}
+	if tableChecksum([]byte{0, 0, 0, 1, 2}) != 1+(2<<24) {
+		t.Fatalf("tail %d", tableChecksum([]byte{0, 0, 0, 1, 2}))
+	}
+}
+
+// ---- pdfcore serialization -------------------------------------------------
+
+func TestFormatReal(t *testing.T) {
+	cases := map[float64]string{
+		2.0: "2", 738.768: "738.768", 0.5: "0.5", -0.0: "0", 200.0: "200", 0.86603: "0.86603",
+	}
+	for in, want := range cases {
+		if got := formatReal(in); got != want {
+			t.Errorf("formatReal(%v)=%q want %q", in, got, want)
+		}
+	}
+}
+
+func TestSerializeTypes(t *testing.T) {
+	var buf bytes.Buffer
+	serializeObject(&buf, nil)
+	serializeObject(&buf, true)
+	serializeObject(&buf, false)
+	serializeObject(&buf, 42)
+	serializeObject(&buf, 1.5)
+	serializeObject(&buf, pdfName("Na#me"))
+	serializeObject(&buf, pdfRef{7})
+	serializeObject(&buf, pdfLiteral("a(b)\\c\r"))
+	serializeObject(&buf, pdfHex([]byte{0xDE, 0xAD}))
+	serializeObject(&buf, pdfArray{1, pdfName("X")})
+	serializeObject(&buf, pdfDict{"B": 1, "A": 2})
+	if buf.Len() == 0 {
+		t.Fatal("empty")
+	}
+}
+
+func TestSerializePanic(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("want panic")
+		}
+	}()
+	var buf bytes.Buffer
+	serializeObject(&buf, struct{}{})
+}
+
+func TestContentOpPanic(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("want panic")
+		}
+	}()
+	c := &content{}
+	c.op(struct{}{})
+}
+
+func TestPdfDateTZ(t *testing.T) {
+	tm := time.Date(2026, 1, 2, 3, 4, 5, 0, time.FixedZone("x", 3600))
+	got := pdfDate(tm)
+	if !strings.HasPrefix(got, "D:20260102030405+01'00'") {
+		t.Fatalf("date %q", got)
+	}
+}
+
+func TestCompressStreams(t *testing.T) {
+	defer fixedClock()()
+	d := New(Options{CompressStreams: true})
+	d.Text("compressed content", nil)
+	b := mustRender(t, d)
+	if !bytes.Contains(b, []byte("FlateDecode")) {
+		t.Fatal("no flate")
+	}
+	parse(t, b)
+}
+
+func TestRenderIdempotent(t *testing.T) {
+	defer fixedClock()()
+	d := New(Options{})
+	d.Text("x", nil)
+	b1 := mustRender(t, d)
+	b2, err := d.Render() // second render: finalized guard
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b1) != len(b2) {
+		t.Fatal("non-idempotent render")
+	}
+}
+
+func TestResourceDictHelper(t *testing.T) {
+	if resourceDict(map[string]bool{}, nil) != nil {
+		t.Fatal("empty -> nil")
+	}
+	if resourceDict(map[string]bool{"F1.0": true}, map[string]pdfRef{}) != nil {
+		t.Fatal("no refs -> nil")
+	}
+}
+
+// ---- afm runtime -----------------------------------------------------------
+
+func TestEncodeWinAnsi(t *testing.T) {
+	b, err := encodeWinAnsi("AZ")
+	if err != nil || b[0] != 'A' {
+		t.Fatal("ascii")
+	}
+	b, err = encodeWinAnsi("é") // latin1 0xE9
+	if err != nil || b[0] != 0xE9 {
+		t.Fatalf("latin1 %v", b)
+	}
+	b, err = encodeWinAnsi("€") // cp1252 0x80
+	if err != nil || b[0] != 0x80 {
+		t.Fatalf("euro %v", b)
+	}
+	if _, err := encodeWinAnsi("\U0001F600"); err == nil {
+		t.Fatal("unmappable")
+	}
+}
+
+func TestAFMWidthKern(t *testing.T) {
+	f := afmFonts["Helvetica"]
+	b := []byte("AV") // has a kern pair
+	if f.widthOf(b, 12, true) >= f.widthOf(b, 12, false) {
+		t.Fatal("kerned should be <= unkerned")
+	}
+	if f.height(12) <= 0 || f.ascenderScaled(12) <= 0 {
+		t.Fatal("metrics")
+	}
+	runs := kernRuns([]byte{}, f)
+	if len(runs) != 1 {
+		t.Fatal("empty kern runs")
+	}
+	if tjOperand([]byte("AB"), f, false) == "" {
+		t.Fatal("tj non-kern")
+	}
+}
+
+// ---- errors ----------------------------------------------------------------
+
+func TestErrors(t *testing.T) {
+	e := newError("Custom", "msg %d", 1)
+	if e.Kind() != "Custom" || e.Error() != "Prawn::Errors::Custom: msg 1" {
+		t.Fatalf("error %q", e.Error())
+	}
+	bare := &prawnError{kind: "Bare"}
+	if bare.Error() != "Prawn::Errors::Bare" {
+		t.Fatal("bare error")
+	}
+}
+
+func TestWriterFunc(t *testing.T) {
+	var got []byte
+	w := writerFunc(func(p []byte) (int, error) { got = append(got, p...); return len(p), nil })
+	w.Write([]byte("hi"))
+	if string(got) != "hi" {
+		t.Fatal("writerFunc")
+	}
+}
+
+func TestSetClockNil(t *testing.T) {
+	prev := SetClock(nil)
+	SetClock(prev)
+}

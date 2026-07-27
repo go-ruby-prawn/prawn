@@ -9,12 +9,16 @@
 
 **A pure-Go (no cgo), MRI-faithful reimplementation of Ruby's
 [`prawn`](https://github.com/prawnpdf/prawn) PDF-generation gem.** It mirrors
-prawn's document DSL — text, fonts, colors, vector graphics, images, a basic
-table and full page management, plus the `Prawn::Errors` tree — while writing the
-actual PDF with the maintained pure-Go
-[`github.com/go-pdf/fpdf`](https://github.com/go-pdf/fpdf) generator. No C PDF
-library, no Ruby runtime: the whole module builds and runs with **CGO disabled**
-on every supported 64-bit target.
+prawn's document DSL — text, fonts (Core-14 **and** embedded/subset TrueType),
+colors (RGB **and** CMYK), vector graphics, images, transformations, a grid,
+bounding boxes, repeaters/page numbering, a table, plus the `Prawn::Errors`
+tree — and writes the PDF with its **own native pure-Go PDF object model and
+content-stream writer**. The emitted content-stream operators match Ruby prawn /
+`PDF::Core` operator-for-operator, so the output is validated against the real
+gem with a `PDF::Inspector`-style differential oracle. No C PDF library, no Ruby
+runtime, and no third-party PDF generator: the module has zero non-stdlib runtime
+dependencies and builds with **CGO disabled** on every supported 64-bit target
+(and to WebAssembly).
 
 It is a PDF backend for
 [go-embedded-ruby](https://github.com/go-embedded-ruby/ruby), but is a
@@ -69,23 +73,45 @@ and parsing them back:
 - **Text** — `Text` (flowing, wrapping, auto-paginating), `DrawText` (absolute),
   `TextBox` (positioned box with `:truncate` / `:expand` / `:error` overflow),
   `Font` / `FontSize` / `Leading`, alignment (left / center / right / justify).
-- **Color** — `FillColor` / `StrokeColor` (hex `"RRGGBB"`), applied to text and
-  shapes.
-- **Graphics** — `Rectangle` / `FillRectangle` / `StrokeRectangle`,
-  `Line` / `StrokeLine`, `Circle` / `FillCircle` / `StrokeCircle`,
-  `Ellipse` / `FillEllipse` / `StrokeEllipse`, `Stroke` / `Fill` /
-  `FillAndStroke`, `StrokeBounds`, `LineWidth`.
-- **Images** — `Image` (file) / `ImageReader` (io) for PNG and JPEG, with
-  `at`, `width`, `height` and aspect-preserving `fit`.
+- **Fonts** — the 14 standard AFM fonts (`Font`/`FontSize`/`Leading`, kerning),
+  **plus TrueType embedding with subsetting** (`RegisterFontTTF`): glyf/loca/hmtx
+  subset following composite references, written as a Type0/CIDFontType2 font with
+  Identity-H, a `FontFile2` stream, a `/W` width array and a `/ToUnicode` CMap.
+- **Formatted text** — `FormattedText` (styled runs) and `TextInline`
+  (`<b>`/`<i>`/`<color>` markup).
+- **Color** — `FillColor` / `StrokeColor` (hex `"RRGGBB"`) **and CMYK**
+  (`FillColorCMYK` / `StrokeColorCMYK`), emitted via prawn's `cs`/`scn`,
+  `CS`/`SCN` operators.
+- **Graphics** — `MoveTo`/`LineTo`/`CurveTo`, `Rectangle`, `Line`, `Polygon`,
+  `Circle`/`Ellipse`, `Stroke`/`Fill`/`FillAndStroke`/`CloseAndStroke`,
+  `StrokeBounds`, `LineWidth`, `CapStyle`/`JoinStyle`, `Dash`/`Undash`.
+- **Layout** — `BoundingBox`, the column/row `Grid`, `Repeat` / `NumberPages`,
+  and affine transforms `Rotate` / `Scale` / `Translate` (with `origin`),
+  `TransformationMatrix`, `SaveGraphicsState`/`RestoreGraphicsState`,
+  `Transparency`.
+- **Images** — `Image` (file) / `ImageReader` (io) for PNG (**alpha → SMask**) and
+  JPEG (DCTDecode passthrough), with `at`, `width`, `height` and `fit`.
 - **Table** — a basic grid (`Table`): explicit or automatic column widths,
   optional bold header row, cell padding and borders, positioning.
 - **Errors** — the `Prawn::Errors` tree (`ErrCannotFit`, `ErrUnknownFont`,
-  `ErrInvalidPageLayout`, `ErrUnsupportedImageType`,
+  `ErrInvalidPageLayout`, `ErrUnsupportedImageType`, `ErrEmptyGraphicStateStack`,
   `ErrIncompatibleStringEncoding`, …).
 
 CGO-free, **100% test coverage**, `gofmt` + `go vet` clean, race-clean, and green
 across the six 64-bit Go targets (amd64, arm64, riscv64, loong64, ppc64le,
-s390x) and three OSes.
+s390x), two WebAssembly targets and three OSes.
+
+## Differential oracle
+
+The output is validated against the real Ruby `prawn` gem the way prawn validates
+itself — with a **`PDF::Inspector`-style parse of the content stream**, not raw
+byte-equality (PDFs carry timestamps and ids). For each scenario, the PDF
+operators this library emits (`BT`/`Td`/`Tf`/kerned `TJ`, `re`/`l`/`m`/`c`,
+`S`/`f`, `cs`/`scn`, `CS`/`SCN`, `cm`, `Do`) are compared operator-for-operator
+against the gem's for the same script. The gem's operator streams are captured
+into `testdata/oracle/*.content` and committed, so the oracle runs in CI without
+Ruby; a skip-gated test re-verifies them against a live gem when one is
+installed. See `prawn_diff_test.go` / `prawn_gem_test.go`.
 
 ## Install
 
@@ -150,7 +176,10 @@ with the pure-Go [`rsc.io/pdf`](https://pkg.go.dev/rsc.io/pdf) reader, asserting
 that each document is a well-formed PDF (header, xref, trailer, `%%EOF`), that the
 expected text appears on the right page with the right font and size, that images
 are embedded as image XObjects, and that table cells and vector graphics are
-drawn. No Ruby runtime and no network are needed.
+drawn. It also runs the committed-fixture **differential operator oracle** (see
+above) comparing the emitted operators to the real prawn gem's. No Ruby runtime
+and no network are needed in CI; the live-gem re-verification skips when Ruby is
+absent. **100% statement coverage** is enforced.
 
 ```sh
 COVERPKG=$(go list ./... | paste -sd, -)
@@ -161,13 +190,14 @@ go tool cover -func=cover.out | tail -1   # 100.0%
 ## Scope
 
 Covered faithfully: document + page management, text (flowing / absolute / box),
-fonts (the 14 standard PDF fonts), color, vector graphics, PNG/JPEG images and a
-basic table.
+formatted/inline text, Core-14 AFM fonts **and** subset-embedded TrueType, color
+(RGB + CMYK), vector graphics, bounding boxes, grid, transformations,
+repeaters/page numbering, PNG/JPEG images and a basic table.
 
-Out of scope (documented in `doc.go`, not implemented): prawn's inline
-formatted-text array and `<b>/<i>` inline tags, full multi-column flowing text,
-advanced prawn-table features (row/column spanning, per-cell style callbacks,
-automatic table pagination), embedded TTF/OTF fonts, and SVG.
+Deferred (named in `doc.go`, not implemented): advanced prawn-table features
+(row/column spanning, per-cell style callbacks, automatic table pagination),
+TrueType `kern`/GPOS kerning for embedded fonts (AFM kerning is complete),
+OpenType/CFF (glyf-based TrueType only), CJK/soft-hyphen line breaking, and SVG.
 
 ## License
 
