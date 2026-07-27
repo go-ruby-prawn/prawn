@@ -24,7 +24,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
       - run: go version
@@ -51,9 +51,9 @@ jobs:
 
   # Validate the library on the six supported 64-bit targets. amd64/arm64 run
   # natively; the rest run the suite under qemu-user. PDF output is a
-  # byte-oriented format, the library has no non-stdlib runtime dependencies, and
-  # all binary parsing (TTF, PDF) is explicitly big-endian, so the big-endian
-  # s390x lane exercises the exact same code path as the little-endian ones.
+  # byte-oriented format and every dependency (fpdf, image/png, image/jpeg,
+  # rsc.io/pdf) is pure Go, so the big-endian s390x lane exercises the exact same
+  # code path as the little-endian ones.
   arch-native:
     name: arch ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
@@ -65,7 +65,7 @@ jobs:
           - { os: ubuntu-24.04-arm, label: arm64 }
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
       - env:
@@ -85,7 +85,7 @@ jobs:
           - { goarch: s390x,   qemu: qemu-s390x-static }
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
       - run: sudo apt-get update && sudo apt-get install -y qemu-user-static
@@ -104,7 +104,7 @@ jobs:
         goos: [js, wasip1]
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
       - name: Build ${{ matrix.goos }}/wasm
