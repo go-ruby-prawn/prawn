@@ -4,48 +4,32 @@
 
 package prawn
 
-// This file implements a basic subset of the prawn-table gem's
-// Prawn::Document#table. It covers the common grid: explicit or automatic column
-// widths, an optional bold header row, per-cell padding, cell borders, and
-// placement at the cursor. Row/column spanning, per-cell style callbacks and
-// automatic multi-page splitting are out of scope (see doc.go).
+// This file implements a common subset of the prawn-table gem's
+// Prawn::Document#table: explicit or automatic column widths, an optional bold
+// header row, per-cell padding, cell borders and placement at the cursor.
+// Row/column spanning, per-cell style callbacks and automatic multi-page
+// splitting are out of scope (named in doc.go).
 
-// TableOptions mirror the frequently used options of prawn-table's table
-// method.
+// TableOptions mirror the frequently used options of prawn-table's table method.
 type TableOptions struct {
-	// ColumnWidths sets each column's width in points. When nil, the width is
-	// split evenly across the margin box.
 	ColumnWidths []float64
-	// Header, when true, renders the first data row in bold (prawn header: true).
-	Header bool
-	// CellPadding is the padding inside every cell in points (prawn
-	// cell.padding). Zero selects prawn's 5pt default.
-	CellPadding float64
-	// BorderWidth is the width of the cell borders in points. Zero selects
-	// prawn's 1pt default; a negative value draws no borders.
-	BorderWidth float64
-	// FontSize is the cell text size in points. Zero keeps the current size.
-	FontSize float64
-	// RowHeight forces every row's height in points. Zero derives it from the
-	// font size and padding.
-	RowHeight float64
-	// At, when set, places the table's top-left corner at the bounds-relative
-	// point (AtX, AtY) instead of at the cursor.
-	AtX, AtY float64
-	AtSet    bool
+	Header       bool
+	CellPadding  float64
+	BorderWidth  float64
+	FontSize     float64
+	RowHeight    float64
+	AtX, AtY     float64
+	AtSet        bool
 }
 
-// TableResult reports the geometry of a rendered table, so callers (and tests)
-// can reason about where it landed.
+// TableResult reports the geometry of a rendered table.
 type TableResult struct {
-	// Width and Height are the overall table dimensions in points.
 	Width, Height float64
-	// ColumnWidths and RowHeights are the resolved per-column / per-row sizes.
-	ColumnWidths []float64
-	RowHeights   []float64
+	ColumnWidths  []float64
+	RowHeights    []float64
 }
 
-// Table mirrors Prawn::Document#table(data, options): it draws a grid of string
+// Table mirrors Prawn::Document#table(data, options): draws a grid of string
 // cells and advances the cursor past it. An empty data set is a no-op.
 func (d *Document) Table(data [][]string, o TableOptions) TableResult {
 	if len(data) == 0 {
@@ -72,7 +56,7 @@ func (d *Document) Table(data [][]string, o TableOptions) TableResult {
 	}
 	fontSize := o.FontSize
 	if fontSize == 0 {
-		fontSize = d.fontSizePts
+		fontSize = d.fontSize
 	}
 	rowHeight := o.RowHeight
 	if rowHeight == 0 {
@@ -89,7 +73,7 @@ func (d *Document) Table(data [][]string, o TableOptions) TableResult {
 			}
 		}
 	} else {
-		w := d.boundsWidth() / float64(cols)
+		w := d.bounds().width / float64(cols)
 		for i := range colWidths {
 			colWidths[i] = w
 		}
@@ -105,62 +89,51 @@ func (d *Document) Table(data [][]string, o TableOptions) TableResult {
 	}
 	totalHeight := rowHeight * float64(len(data))
 
-	// Top-left origin (bounds-relative, y up).
-	originX := 0.0
-	originY := d.cursor
+	originX, originY := 0.0, d.cursor
 	if o.AtSet {
 		originX, originY = o.AtX, o.AtY
 	}
 
-	// Save current text state; the header row temporarily switches to bold.
-	prevStyle := d.fontStyle
-	prevSize := d.fontSizePts
-	d.fontSizePts = fontSize
-	d.applyFont()
+	prevFont, prevSize := d.curFont, d.fontSize
+	d.fontSize = fontSize
+	if drawBorders {
+		d.LineWidth(border)
+	}
+	asc := d.curAscender(fontSize)
 
 	y := originY
-	if drawBorders {
-		d.f.SetLineWidth(border)
-	}
 	for r, row := range data {
 		x := originX
 		bold := o.Header && r == 0
 		if bold {
-			d.fontStyle = StyleBold
-			d.applyFont()
+			d.curFont = d.registerAFM(d.afmFamilyName(), StyleBold)
+			asc = d.curAscender(fontSize)
 		}
 		for c := 0; c < cols; c++ {
 			cw := colWidths[c]
 			if drawBorders {
-				fx, fy := d.toFpdfXY(x, y)
-				d.f.SetDrawColor(d.strokeColor[0], d.strokeColor[1], d.strokeColor[2])
-				d.f.Rect(fx, fy, cw, rowHeights[r], "D")
+				d.StrokeRectangle(x, y, cw, rowHeights[r])
 			}
 			var text string
 			if c < len(row) {
 				text = row[c]
 			}
 			if text != "" {
-				// Baseline: padding down from the cell top.
-				baseline := y - padding - fontSize*ascentFactor
-				tx, ty := d.toFpdfXY(x+padding, baseline)
-				d.f.Text(tx, ty, text)
+				baseline := y - padding - asc
+				d.drawLine(text, x+padding, baseline)
 			}
 			x += cw
 		}
 		if bold {
-			d.fontStyle = prevStyle
-			d.applyFont()
+			d.curFont = prevFont
+			asc = d.curAscender(fontSize)
 		}
 		y -= rowHeights[r]
 	}
 
-	// Restore state and advance the cursor past the table when flowing.
-	d.fontStyle = prevStyle
-	d.fontSizePts = prevSize
-	d.applyFont()
+	d.curFont, d.fontSize = prevFont, prevSize
 	if drawBorders {
-		d.f.SetLineWidth(d.lineWidth)
+		d.LineWidth(d.lineWidth)
 	}
 	if !o.AtSet {
 		d.cursor = originY - totalHeight
@@ -172,4 +145,48 @@ func (d *Document) Table(data [][]string, o TableOptions) TableResult {
 		ColumnWidths: colWidths,
 		RowHeights:   rowHeights,
 	}
+}
+
+// afmFamilyName returns a Core-14 family name for the current font (falling back
+// to Helvetica for embedded fonts), used to derive the bold header face.
+func (d *Document) afmFamilyName() string {
+	if d.curFont.afm != nil {
+		switch {
+		case containsFold(d.curFont.afm.Name, "Courier"):
+			return "Courier"
+		case containsFold(d.curFont.afm.Name, "Times"):
+			return "Times-Roman"
+		}
+	}
+	return "Helvetica"
+}
+
+func containsFold(s, sub string) bool { return indexFold(s, sub) >= 0 }
+
+func indexFold(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if equalFold(s[i:i+len(sub)], sub) {
+			return i
+		}
+	}
+	return -1
+}
+
+func equalFold(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		ca, cb := a[i], b[i]
+		if 'A' <= ca && ca <= 'Z' {
+			ca += 'a' - 'A'
+		}
+		if 'A' <= cb && cb <= 'Z' {
+			cb += 'a' - 'A'
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
 }

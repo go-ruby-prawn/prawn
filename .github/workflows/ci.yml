@@ -51,9 +51,9 @@ jobs:
 
   # Validate the library on the six supported 64-bit targets. amd64/arm64 run
   # natively; the rest run the suite under qemu-user. PDF output is a
-  # byte-oriented format and every dependency (fpdf, image/png, image/jpeg,
-  # rsc.io/pdf) is pure Go, so the big-endian s390x lane exercises the exact same
-  # code path as the little-endian ones.
+  # byte-oriented format, the library has no non-stdlib runtime dependencies, and
+  # all binary parsing (TTF, PDF) is explicitly big-endian, so the big-endian
+  # s390x lane exercises the exact same code path as the little-endian ones.
   arch-native:
     name: arch ${{ matrix.label }}
     runs-on: ${{ matrix.os }}

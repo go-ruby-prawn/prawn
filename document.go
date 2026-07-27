@@ -5,12 +5,11 @@
 package prawn
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"strings"
 	"time"
-
-	"github.com/go-pdf/fpdf"
 )
 
 // Style mirrors a prawn font style symbol (:normal, :bold, :italic,
@@ -28,19 +27,6 @@ const (
 	StyleBoldItalic
 )
 
-func (s Style) fpdfStyle() string {
-	switch s {
-	case StyleBold:
-		return "B"
-	case StyleItalic:
-		return "I"
-	case StyleBoldItalic:
-		return "BI"
-	default:
-		return ""
-	}
-}
-
 // Align mirrors a prawn alignment symbol (:left, :center, :right, :justify).
 type Align int
 
@@ -51,9 +37,7 @@ const (
 	AlignCenter
 	// AlignRight right-aligns text (prawn :right).
 	AlignRight
-	// AlignJustify justifies text (prawn :justify). It is treated as left
-	// alignment for the final line, matching prawn's behaviour for a single
-	// short line.
+	// AlignJustify justifies text (prawn :justify).
 	AlignJustify
 )
 
@@ -70,22 +54,22 @@ type Options struct {
 	// PageLayout is "portrait" (default) or "landscape".
 	PageLayout string
 	// Margin, when non-nil, sets all four margins to the same value in points.
-	// nil selects prawn's 36pt default. Margins overrides it when set.
 	Margin *float64
 	// Margins, when non-nil, sets the four margins explicitly as
 	// [top, right, bottom, left] in points (prawn's margin: [t, r, b, l]).
 	Margins *[4]float64
+	// SkipPageCreation suppresses the initial page (prawn skip_page_creation).
+	SkipPageCreation bool
+	// CompressStreams enables FlateDecode on content streams (prawn compress).
+	CompressStreams bool
 }
 
-// clock is the seam that supplies the PDF /CreationDate. It defaults to the wall
-// clock but is replaced by SetClock so tests (and any reproducible build) get
-// deterministic, timezone-independent output.
+// clock is the seam that supplies the PDF /CreationDate; SetClock replaces it so
+// output is reproducible.
 var clock = time.Now
 
 // SetClock overrides the time source used for the PDF /CreationDate and returns
-// the previous source, so callers can restore it. Passing nil resets to the
-// wall clock (time.Now). This is the determinism seam described in the package
-// doc: pin it to make Render byte-for-byte reproducible.
+// the previous source. Passing nil resets to the wall clock (time.Now).
 func SetClock(fn func() time.Time) (previous func() time.Time) {
 	previous = clock
 	if fn == nil {
@@ -96,85 +80,130 @@ func SetClock(fn func() time.Time) (previous func() time.Time) {
 	return previous
 }
 
-// Document mirrors Prawn::Document. It wraps a pure-Go fpdf generator and tracks
-// the prawn drawing state (current font, colors, line width, leading and the
-// text cursor). Errors are accumulated sticky-style, like fpdf itself: once a
-// method fails, later methods are no-ops and Render / Error report the failure.
+// boundingBox is prawn's bounds: a rectangle in absolute page coordinates
+// (origin bottom-left, y up).
+type boundingBox struct {
+	absLeft, absBottom, width, height float64
+}
+
+// page is one PDF page: its content stream plus the per-page resource usage.
+type page struct {
+	content   *content
+	width     float64
+	height    float64
+	fontsUsed map[string]bool // set of font resource names used on this page
+	xobjsUsed map[string]bool // set of image XObject names used
+	gsUsed    map[string]bool // set of ExtGState names used
+	fillCS    string          // current fill color space name ("" = unset this page)
+	strokeCS  string
+	saveDepth int // open q's from save_graphics_state
+}
+
+// fontRef is a registered font: its PDF resource name ("F1.0") and either a
+// Core-14 AFM font or an embedded TTF font.
+type fontRef struct {
+	resName string
+	afm     *afmFont
+	ttf     *ttfFont
+}
+
+// Document mirrors Prawn::Document. It owns a native PDF object model (no cgo,
+// no third-party PDF writer) and tracks prawn's drawing state so the emitted
+// content-stream operators match Ruby prawn's.
 type Document struct {
-	f *fpdf.Fpdf
+	pages   []*page
+	cur     *page
+	boundsS []boundingBox // bounding-box stack; boundsS[len-1] is current
 
 	pageWidth, pageHeight        float64
 	mTop, mRight, mBottom, mLeft float64
-	cursor                       float64 // distance from bounds bottom to the top of the next line
-	fontFamily                   string
-	fontStyle                    Style
-	fontSizePts                  float64
-	fillColor                    [3]int
-	strokeColor                  [3]int
-	lineWidth                    float64
-	leading                      float64
-	path                         []pathOp
-	imgSeq                       int
-	err                          error
+	cursor                       float64
+
+	fonts     map[string]*fontRef
+	fontOrder int
+	curFont   *fontRef
+	fontSize  float64
+	leading   float64
+	kerning   bool
+
+	fillColor   colorVal
+	strokeColor colorVal
+	lineWidth   float64
+	dash        []float64
+	dashPhase   float64
+	lineCap     int
+	lineJoin    int
+
+	imgSeq            int
+	imgOrder          int
+	images            map[string]*imageXObject // registration key -> decoded image XObject
+	gsSeq             int
+	gstates           map[string]*extGState // key -> ExtGState (alpha/transparency)
+	repeaters         []*repeater
+	rptPage, rptTotal int
+
+	compress  bool
+	finalized bool
+	err       error
 }
 
-// stdFonts is the set of the 14 standard PDF fonts prawn ships without any
-// embedded font file. Keys are the prawn family names (case-insensitive).
-var stdFonts = map[string]string{
-	"helvetica":    "Helvetica",
-	"courier":      "Courier",
-	"times-roman":  "Times",
-	"times":        "Times",
-	"symbol":       "Symbol",
-	"zapfdingbats": "ZapfDingbats",
-}
-
-// New creates a Document, mirroring Prawn::Document.new(options). It starts with
-// a single blank page, the Helvetica 12pt font, black fill/stroke colors and a
-// 1pt line width — prawn's defaults — and the cursor at the top of the margin
-// box.
+// New creates a Document, mirroring Prawn::Document.new(options).
 func New(o Options) *Document {
 	w, h, err := resolvePageSize(o)
 	d := &Document{
 		pageWidth:   w,
 		pageHeight:  h,
-		fontFamily:  "Helvetica",
-		fontStyle:   StyleNormal,
-		fontSizePts: 12,
-		fillColor:   [3]int{0, 0, 0},
-		strokeColor: [3]int{0, 0, 0},
+		fontSize:    12,
+		kerning:     true,
+		fillColor:   rgbColor(0, 0, 0),
+		strokeColor: rgbColor(0, 0, 0),
 		lineWidth:   1,
+		lineCap:     0,
+		lineJoin:    0,
+		fonts:       map[string]*fontRef{},
+		images:      map[string]*imageXObject{},
+		gstates:     map[string]*extGState{},
+		compress:    o.CompressStreams,
 	}
 	d.mTop, d.mRight, d.mBottom, d.mLeft = resolveMargins(o)
+	d.err = err
 
-	f := fpdf.NewCustom(&fpdf.InitType{
-		OrientationStr: "P",
-		UnitStr:        "pt",
-		Size:           fpdf.SizeType{Wd: w, Ht: h},
-	})
-	f.SetAutoPageBreak(false, 0)
-	f.SetMargins(d.mLeft, d.mTop, d.mRight)
-	f.SetCreationDate(clock())
-	// Prawn does not compress content streams by default; keep output plainly
-	// inspectable and deterministic.
-	f.SetCompression(false)
-	d.f = f
-	d.err = err // an invalid page layout is reported through Render/Error.
+	// The default font (Helvetica, normal) is registered eagerly so it takes
+	// resource identifier F1.0, exactly as prawn does at construction.
+	d.curFont = d.registerAFM("Helvetica", StyleNormal)
 
-	f.AddPage()
-	f.SetFont("Helvetica", "", 12)
-	f.SetTextColor(0, 0, 0)
-	f.SetFillColor(0, 0, 0)
-	f.SetDrawColor(0, 0, 0)
-	f.SetLineWidth(1)
-	d.cursor = d.boundsHeight()
+	if !o.SkipPageCreation {
+		d.startPage()
+	}
 	return d
 }
 
-// Generate mirrors Prawn::Document.generate(path) { |pdf| … }: it creates a
-// document, runs block against it, and writes the rendered PDF to path. If block
-// returns an error, or rendering fails, that error is returned and no file is
-// written.
+// startPage appends a fresh page and resets the cursor and margin box.
+func (d *Document) startPage() {
+	p := &page{
+		content:   &content{},
+		width:     d.pageWidth,
+		height:    d.pageHeight,
+		fontsUsed: map[string]bool{},
+		xobjsUsed: map[string]bool{},
+		gsUsed:    map[string]bool{},
+	}
+	p.content.raw("q") // prawn wraps each page's content in a save/restore
+	d.pages = append(d.pages, p)
+	d.cur = p
+	d.boundsS = []boundingBox{{
+		absLeft:   d.mLeft,
+		absBottom: d.mBottom,
+		width:     d.pageWidth - d.mLeft - d.mRight,
+		height:    d.pageHeight - d.mTop - d.mBottom,
+	}}
+	d.cursor = d.bounds().height
+}
+
+// bounds returns the current bounding box.
+func (d *Document) bounds() boundingBox { return d.boundsS[len(d.boundsS)-1] }
+
+// Generate mirrors Prawn::Document.generate(path) { |pdf| … }.
 func Generate(path string, block func(*Document) error) error {
 	d := New(Options{})
 	if err := block(d); err != nil {
@@ -183,8 +212,7 @@ func Generate(path string, block func(*Document) error) error {
 	return d.RenderFile(path)
 }
 
-// GenerateTo mirrors Prawn::Document.generate(io) { |pdf| … } for an arbitrary
-// writer instead of a file path.
+// GenerateTo mirrors Prawn::Document.generate(io) { |pdf| … } for a writer.
 func GenerateTo(w io.Writer, block func(*Document) error) error {
 	d := New(Options{})
 	if err := block(d); err != nil {
@@ -207,25 +235,7 @@ func GenerateWith(path string, o Options, block func(*Document) error) error {
 	return d.RenderFile(path)
 }
 
-// Render mirrors Prawn::Document#render: it returns the finished PDF as bytes.
-// Any error accumulated while building the document (or emitted by the
-// underlying generator) is returned here.
-func (d *Document) Render() ([]byte, error) {
-	if d.err != nil {
-		return nil, d.err
-	}
-	var b strings.Builder
-	if err := d.f.Output(writerFunc(func(p []byte) (int, error) {
-		b.Write(p)
-		return len(p), nil
-	})); err != nil {
-		return nil, err
-	}
-	return []byte(b.String()), nil
-}
-
-// RenderFile mirrors Prawn::Document#render_file(path): it renders and writes
-// the PDF to path.
+// RenderFile mirrors Prawn::Document#render_file(path).
 func (d *Document) RenderFile(path string) error {
 	b, err := d.Render()
 	if err != nil {
@@ -234,24 +244,99 @@ func (d *Document) RenderFile(path string) error {
 	return os.WriteFile(path, b, 0o644)
 }
 
-// Error reports the first error accumulated while building the document, or nil.
-func (d *Document) Error() error {
-	if d.err != nil {
-		return d.err
+// Error reports the first accumulated build error, or nil.
+func (d *Document) Error() error { return d.err }
+
+// fail records the first error; later calls keep the earliest one.
+func (d *Document) fail(err error) {
+	if d.err == nil {
+		d.err = err
 	}
-	return d.f.Error()
 }
 
-// writerFunc adapts a function to io.Writer so Render can collect output without
-// a bytes.Buffer import cycle in callers.
-type writerFunc func([]byte) (int, error)
+// StartNewPage mirrors Prawn::Document#start_new_page. Pages are closed
+// (their content balanced) only at render time, so repeaters and page
+// numbering can still draw onto any page.
+func (d *Document) StartNewPage() {
+	d.startPage()
+	// prawn re-asserts the current colors on each new page (update_colors).
+	d.emitFillColor()
+	d.emitStrokeColor()
+}
 
-func (w writerFunc) Write(p []byte) (int, error) { return w(p) }
+// finishPage closes a page's balance: any still-open save_graphics_state, then
+// the page-level "q" written at page start.
+func (d *Document) finishPage(p *page) {
+	for p.saveDepth > 0 {
+		p.content.raw("Q")
+		p.saveDepth--
+	}
+	p.content.raw("Q")
+}
 
-// resolvePageSize turns Options into a concrete width/height in points, applying
-// the page layout. An unknown layout yields ErrInvalidPageLayout; an unknown
-// named size falls back to LETTER (prawn raises, but here the error surfaces via
-// the layout/known-size checks and we keep a sane default).
+// PageCount mirrors Prawn::Document#page_count.
+func (d *Document) PageCount() int { return len(d.pages) }
+
+// PageNumber returns the current (1-based) page number.
+func (d *Document) PageNumber() int { return len(d.pages) }
+
+// PageWidth returns the current page width in points.
+func (d *Document) PageWidth() float64 { return d.pageWidth }
+
+// PageHeight returns the current page height in points.
+func (d *Document) PageHeight() float64 { return d.pageHeight }
+
+// Bounds exposes the current margin/bounding box.
+type Bounds struct {
+	Width, Height float64
+	Left, Bottom  float64
+}
+
+// Bounds returns the current bounding box (Prawn::Document#bounds).
+func (d *Document) Bounds() Bounds {
+	b := d.bounds()
+	return Bounds{Width: b.width, Height: b.height, Left: b.absLeft, Bottom: b.absBottom}
+}
+
+// Cursor mirrors Prawn::Document#cursor.
+func (d *Document) Cursor() float64 { return d.cursor }
+
+// MoveCursorTo mirrors Prawn::Document#move_cursor_to.
+func (d *Document) MoveCursorTo(y float64) { d.cursor = y }
+
+// MoveDown mirrors Prawn::Document#move_down.
+func (d *Document) MoveDown(n float64) { d.cursor -= n }
+
+// MoveUp mirrors Prawn::Document#move_up.
+func (d *Document) MoveUp(n float64) { d.cursor += n }
+
+// Pad mirrors Prawn::Document#pad.
+func (d *Document) Pad(n float64, block func()) {
+	d.MoveDown(n)
+	block()
+	d.MoveDown(n)
+}
+
+// PadTop mirrors Prawn::Document#pad_top.
+func (d *Document) PadTop(n float64, block func()) {
+	d.MoveDown(n)
+	block()
+}
+
+// PadBottom mirrors Prawn::Document#pad_bottom.
+func (d *Document) PadBottom(n float64, block func()) {
+	block()
+	d.MoveDown(n)
+}
+
+// mapToAbs converts a bounds-relative point (prawn origin: current bounds'
+// lower-left, y up) to absolute page coordinates.
+func (d *Document) mapToAbs(x, y float64) (float64, float64) {
+	b := d.bounds()
+	return b.absLeft + x, b.absBottom + y
+}
+
+// resolvePageSize turns Options into a concrete width/height in points.
 func resolvePageSize(o Options) (w, h float64, err error) {
 	if o.PageWidth > 0 && o.PageHeight > 0 {
 		w, h = o.PageWidth, o.PageHeight
@@ -268,7 +353,6 @@ func resolvePageSize(o Options) (w, h float64, err error) {
 	}
 	switch strings.ToLower(o.PageLayout) {
 	case "", "portrait":
-		// keep as-is
 	case "landscape":
 		w, h = h, w
 	default:
@@ -288,114 +372,64 @@ func resolveMargins(o Options) (top, right, bottom, left float64) {
 	return 36, 36, 36, 36
 }
 
-// boundsHeight is the height of the margin box (prawn bounds.height).
-func (d *Document) boundsHeight() float64 { return d.pageHeight - d.mTop - d.mBottom }
-
-// boundsWidth is the width of the margin box (prawn bounds.width).
-func (d *Document) boundsWidth() float64 { return d.pageWidth - d.mLeft - d.mRight }
-
-// Bounds mirrors Prawn::Document#bounds enough to expose the margin box: its
-// width, height and the absolute (page) coordinates of its lower-left corner.
-type Bounds struct {
-	// Width and Height are the margin box dimensions in points.
-	Width, Height float64
-	// Left and Bottom are the page-absolute coordinates (from the page's
-	// lower-left corner) of the margin box's lower-left corner.
-	Left, Bottom float64
+// registerAFM returns (registering if necessary) the fontRef for a Core-14 font
+// family+style, assigning it the next resource identifier.
+func (d *Document) registerAFM(family string, style Style) *fontRef {
+	base := afmBaseName(family, style)
+	key := "afm:" + base
+	if fr, ok := d.fonts[key]; ok {
+		return fr
+	}
+	d.fontOrder++
+	fr := &fontRef{
+		resName: fmt.Sprintf("F%d.0", d.fontOrder),
+		afm:     afmFonts[base],
+	}
+	d.fonts[key] = fr
+	return fr
 }
 
-// Bounds returns the current margin box (Prawn::Document#bounds).
-func (d *Document) Bounds() Bounds {
-	return Bounds{
-		Width:  d.boundsWidth(),
-		Height: d.boundsHeight(),
-		Left:   d.mLeft,
-		Bottom: d.mBottom,
+// afmBaseName maps a prawn family name + style to a Core-14 PostScript name.
+func afmBaseName(family string, style Style) string {
+	f := strings.ToLower(family)
+	switch f {
+	case "courier":
+		return pick("Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique", style)
+	case "times-roman", "times":
+		return pick("Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic", style)
+	case "symbol":
+		return "Symbol"
+	case "zapfdingbats":
+		return "ZapfDingbats"
+	default: // helvetica / arial / sans-serif
+		return pick("Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique", style)
 	}
 }
 
-// Cursor mirrors Prawn::Document#cursor: the vertical position of the drawing
-// cursor measured from the bottom of the margin box (bounds.height at the top of
-// a fresh page, 0 at the bottom).
-func (d *Document) Cursor() float64 { return d.cursor }
-
-// MoveCursorTo mirrors Prawn::Document#move_cursor_to: place the cursor at an
-// absolute height within the margin box.
-func (d *Document) MoveCursorTo(y float64) { d.cursor = y }
-
-// MoveDown mirrors Prawn::Document#move_down: lower the cursor by n points.
-func (d *Document) MoveDown(n float64) { d.cursor -= n }
-
-// MoveUp mirrors Prawn::Document#move_up: raise the cursor by n points.
-func (d *Document) MoveUp(n float64) { d.cursor += n }
-
-// Pad mirrors Prawn::Document#pad: move the cursor down by n, run block, then
-// move down by n again.
-func (d *Document) Pad(n float64, block func()) {
-	d.MoveDown(n)
-	block()
-	d.MoveDown(n)
-}
-
-// PadTop mirrors Prawn::Document#pad_top: move down by n, then run block.
-func (d *Document) PadTop(n float64, block func()) {
-	d.MoveDown(n)
-	block()
-}
-
-// PadBottom mirrors Prawn::Document#pad_bottom: run block, then move down by n.
-func (d *Document) PadBottom(n float64, block func()) {
-	block()
-	d.MoveDown(n)
-}
-
-// StartNewPage mirrors Prawn::Document#start_new_page: begin a fresh page and
-// reset the cursor to the top of the margin box.
-func (d *Document) StartNewPage() {
-	d.f.AddPage()
-	// fpdf resets font/colors per page via its state; re-assert prawn state.
-	d.applyFont()
-	d.applyFillColor()
-	d.applyStrokeColor()
-	d.f.SetLineWidth(d.lineWidth)
-	d.cursor = d.boundsHeight()
-}
-
-// PageCount mirrors Prawn::Document#page_count.
-func (d *Document) PageCount() int { return d.f.PageCount() }
-
-// PageWidth returns the current page width in points.
-func (d *Document) PageWidth() float64 { return d.pageWidth }
-
-// PageHeight returns the current page height in points.
-func (d *Document) PageHeight() float64 { return d.pageHeight }
-
-// fail records the first error; later calls keep the earliest one.
-func (d *Document) fail(err error) {
-	if d.err == nil {
-		d.err = err
+func pick(normal, bold, italic, boldItalic string, s Style) string {
+	switch s {
+	case StyleBold:
+		return bold
+	case StyleItalic:
+		return italic
+	case StyleBoldItalic:
+		return boldItalic
+	default:
+		return normal
 	}
 }
 
-// toFpdfXY converts a point given in prawn bounds-relative coordinates (origin
-// at the lower-left of the margin box, y increasing upward) to fpdf's top-left
-// page coordinates (origin at the upper-left of the page, y increasing
-// downward).
-func (d *Document) toFpdfXY(x, y float64) (float64, float64) {
-	absX := d.mLeft + x
-	absYfromTop := d.pageHeight - (d.mBottom + y)
-	return absX, absYfromTop
+// isAFMFamily reports whether name is a recognized Core-14 family.
+func isAFMFamily(name string) bool {
+	switch strings.ToLower(name) {
+	case "courier", "times-roman", "times", "symbol", "zapfdingbats",
+		"helvetica", "arial", "sans-serif":
+		return true
+	}
+	return false
 }
 
-func (d *Document) applyFont() {
-	d.f.SetFont(stdFonts[strings.ToLower(d.fontFamily)], d.fontStyle.fpdfStyle(), d.fontSizePts)
-}
+// writerFunc adapts a function to io.Writer.
+type writerFunc func([]byte) (int, error)
 
-func (d *Document) applyFillColor() {
-	d.f.SetFillColor(d.fillColor[0], d.fillColor[1], d.fillColor[2])
-	d.f.SetTextColor(d.fillColor[0], d.fillColor[1], d.fillColor[2])
-}
-
-func (d *Document) applyStrokeColor() {
-	d.f.SetDrawColor(d.strokeColor[0], d.strokeColor[1], d.strokeColor[2])
-}
+func (w writerFunc) Write(p []byte) (int, error) { return w(p) }
