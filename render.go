@@ -184,6 +184,9 @@ func (d *Document) buildFontObject(doc *pdfDoc, fr *fontRef) pdfRef {
 		}
 		return doc.add(dict)
 	}
+	if fr.otf != nil {
+		return fr.otf.buildObjects(doc)
+	}
 	return fr.ttf.buildObjects(doc)
 }
 

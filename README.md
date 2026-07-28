@@ -194,10 +194,28 @@ formatted/inline text, Core-14 AFM fonts **and** subset-embedded TrueType, color
 (RGB + CMYK), vector graphics, bounding boxes, grid, transformations,
 repeaters/page numbering, PNG/JPEG images and a basic table.
 
+Font embedding also has a **go-opentype-backed backend** (`RegisterFontOTF`)
+built on the pure-Go [`github.com/go-opentype/opentype`](https://github.com/go-opentype/opentype)
++ [`.../shape`](https://github.com/go-opentype/shape) stack. On top of the
+glyf/TrueType path it adds:
+
+- **CFF/OpenType** (`.otf`, "OTTO") embedding as a CIDFontType0 descendant with
+  a FontFile3 (`/Subtype /OpenType`) program;
+- an **opt-in shaped-text path** (`OTFOptions{Shape: true}`) so Arabic joining,
+  Indic reordering, CJK and Latin ligatures/kerning (GSUB + GPOS) render with
+  the correct glyphs and spacing, emitted as a positioned `TJ` array;
+- **variable-font instance selection** (`OTFOptions{Variation: {"wght": 700}}`),
+  so measured widths and the per-CID `/W` advances follow the chosen axis.
+
+The default Prawn text API (`text`, `formatted_text`, `font`, `width_of`) is
+unchanged; shaping and variation are opt-in, so default output stays
+Prawn-compatible.
+
 Deferred (named in `doc.go`, not implemented): advanced prawn-table features
 (row/column spanning, per-cell style callbacks, automatic table pagination),
-TrueType `kern`/GPOS kerning for embedded fonts (AFM kerning is complete),
-OpenType/CFF (glyf-based TrueType only), CJK/soft-hyphen line breaking, and SVG.
+GPOS mark-attachment vertical placement in the PDF (substitution + horizontal
+advances are applied), glyf/CFF subsetting for the OTF backend (the whole font
+program is embedded), CJK/soft-hyphen line breaking, and SVG.
 
 ## License
 

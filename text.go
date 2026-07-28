@@ -43,10 +43,14 @@ func (d *Document) Font(name string, style Style) {
 
 // FontFamily returns the current font's PostScript/base name.
 func (d *Document) FontFamily() string {
-	if d.curFont.afm != nil {
+	switch {
+	case d.curFont.afm != nil:
 		return d.curFont.afm.Name
+	case d.curFont.otf != nil:
+		return d.curFont.otf.name
+	default:
+		return d.curFont.ttf.name
 	}
-	return d.curFont.ttf.name
 }
 
 // FontStyle reports the current style inferred from the base font name.
@@ -86,18 +90,26 @@ func (d *Document) KerningEnabled() bool { return d.kerning }
 
 // curAscender returns the current font's ascender at the given size.
 func (d *Document) curAscender(size float64) float64 {
-	if d.curFont.afm != nil {
+	switch {
+	case d.curFont.afm != nil:
 		return d.curFont.afm.ascenderScaled(size)
+	case d.curFont.otf != nil:
+		return d.curFont.otf.ascenderScaled(size)
+	default:
+		return d.curFont.ttf.ascenderScaled(size)
 	}
-	return d.curFont.ttf.ascenderScaled(size)
 }
 
 // curHeight returns the current font's line height at the given size.
 func (d *Document) curHeight(size float64) float64 {
-	if d.curFont.afm != nil {
+	switch {
+	case d.curFont.afm != nil:
 		return d.curFont.afm.height(size)
+	case d.curFont.otf != nil:
+		return d.curFont.otf.height(size)
+	default:
+		return d.curFont.ttf.height(size)
 	}
-	return d.curFont.ttf.height(size)
 }
 
 // lineHeight is one line's vertical advance: font height + document leading +
@@ -122,14 +134,18 @@ func (d *Document) WidthOfString(s string) float64 {
 }
 
 func (d *Document) widthOfSized(s string, size float64, kerning bool) float64 {
-	if d.curFont.afm != nil {
+	switch {
+	case d.curFont.afm != nil:
 		b, err := encodeWinAnsi(s)
 		if err != nil {
 			return 0
 		}
 		return d.curFont.afm.widthOf(b, size, kerning)
+	case d.curFont.otf != nil:
+		return d.curFont.otf.widthOf(s, size)
+	default:
+		return d.curFont.ttf.widthOf(s, size)
 	}
-	return d.curFont.ttf.widthOf(s, size)
 }
 
 // applyTextOptions applies per-call overrides and returns a restore function.
@@ -181,14 +197,17 @@ func (d *Document) drawLine(s string, x, y float64) {
 	c.raw("BT")
 	c.op(ax, ay, "Td")
 	c.raw("/" + d.curFont.resName + " " + numToken(d.fontSize) + " Tf")
-	if d.curFont.afm != nil {
+	switch {
+	case d.curFont.afm != nil:
 		b, _ := encodeWinAnsi(s)
 		if d.kerning {
 			c.raw(tjOperand(b, d.curFont.afm, true) + " TJ")
 		} else {
 			c.raw("<" + hexEncode(b) + "> Tj")
 		}
-	} else {
+	case d.curFont.otf != nil:
+		c.raw(d.curFont.otf.operand(s))
+	default:
 		gids := d.curFont.ttf.encode(s)
 		c.raw("<" + hexEncode(gidBytes(gids)) + "> Tj")
 	}
