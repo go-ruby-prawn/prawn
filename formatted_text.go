@@ -44,9 +44,6 @@ func (d *Document) FormattedText(frags []FormattedFragment, opts *TextOptions) {
 	defer restore()
 
 	baseFamily := d.FontFamily()
-	if d.curFont.afm == nil {
-		baseFamily = d.curFont.ttf.name
-	}
 	width := d.bounds().width
 
 	type word struct {

@@ -105,6 +105,7 @@ type fontRef struct {
 	resName string
 	afm     *afmFont
 	ttf     *ttfFont
+	otf     *otfFont
 }
 
 // Document mirrors Prawn::Document. It owns a native PDF object model (no cgo,
