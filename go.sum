@@ -2,8 +2,8 @@ github.com/go-opentype/bidi v0.2.0 h1:ze8chEUw22c98LZug2GByD9cc3Zuq0qARxrSLGj1io
 github.com/go-opentype/bidi v0.2.0/go.mod h1:PaWZ9P93jwQaXsEvAoSxvJ3P70S9f8TuFGDstTvcfmM=
 github.com/go-opentype/fonts v0.3.0 h1:ufqQmIoc34aDufJzUAVaufGcFV5ljJEv4IqmZGF3+4E=
 github.com/go-opentype/fonts v0.3.0/go.mod h1:C6yQL2apHItfEZ5hztpsHF0S5mlX/hklLlq/Z5fRG/g=
-github.com/go-opentype/opentype v0.4.0 h1:os4hpek0Hwg32DjEaE6BgcWYihieUXvFk+cMcQCxpFU=
-github.com/go-opentype/opentype v0.4.0/go.mod h1:AOixevJf7XQaH7+WG+OMIOZEbYPXfMqklVk26Y6YTUU=
+github.com/go-opentype/opentype v0.5.0 h1:++VoqgbXgYACyTTNzUAivoxW9M3m2gxWMAn6bIY7DXg=
+github.com/go-opentype/opentype v0.5.0/go.mod h1:AOixevJf7XQaH7+WG+OMIOZEbYPXfMqklVk26Y6YTUU=
 github.com/go-opentype/shape v0.3.3 h1:oo6e/cnA4VYmQ7T8epr6OoO3mQS4zC2PrT2jMx2orAE=
 github.com/go-opentype/shape v0.3.3/go.mod h1:oVq3kFGx6kIHKrFXfxqnp8JUYR7k9NzeY+E17LYHhrU=
 rsc.io/pdf v0.1.1 h1:k1MczvYDUvJBe93bYd7wrZLLUEcLZAuF824/I4e5Xr4=

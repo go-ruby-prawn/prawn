@@ -6,13 +6,14 @@ package prawn
 
 // This file is the go-opentype-backed font backend. Where ttf.go hand-rolls a
 // TrueType-only parser and glyf subsetter, this backend delegates parsing,
-// glyph mapping (cmap), advance metrics, complex-script shaping (GSUB/GPOS) and
-// variable-font instancing to the pure-Go github.com/go-opentype/opentype stack
-// (plus github.com/go-opentype/shape for Arabic/Indic/CJK shaping). It thereby
-// gains three capabilities the ttf.go path cannot offer:
+// glyph mapping (cmap), advance metrics, complex-script shaping (GSUB/GPOS),
+// variable-font instancing and — since go-opentype v0.5 — the FontDescriptor
+// scalars and font subsetting to the pure-Go github.com/go-opentype/opentype
+// stack (plus github.com/go-opentype/shape for Arabic/Indic/CJK shaping). It
+// thereby gains three capabilities the ttf.go path cannot offer:
 //
 //   - CFF/OpenType ("OTTO", a 'CFF ' table) font embedding, as a
-//     CIDFontType0 descendant with a FontFile3 (/Subtype /OpenType) program;
+//     CIDFontType0 descendant with a FontFile3 program;
 //   - an opt-in shaped-text path so Arabic joining, Indic reordering and CJK
 //     render with the correct glyphs and positioning;
 //   - selecting a variable-font instance (SetVariation) so measured widths and
@@ -20,9 +21,31 @@ package prawn
 //
 // glyf-outline fonts registered through this backend embed as a CIDFontType2 /
 // FontFile2 instead, so the same shaping and variation features also work for
-// TrueType-outline fonts. Encoding is Identity-H with CIDToGIDMap Identity, so
-// the whole font program is embedded and the CID is the original glyph id (no
-// glyf subsetting is performed here; see the scope note on subsetting below).
+// TrueType-outline fonts.
+//
+// Both outline flavours are now subset before embedding rather than shipped
+// whole: a glyf font through opentype.Font.SubsetTrueType (embedding the compact
+// subset plus a /CIDToGIDMap built from the old->new glyph remap), a CFF/OpenType
+// font through opentype.Font.SubsetCFF (a CIDFontType0C program whose glyph
+// numbering is preserved, so an Identity map stays valid). Encoding is Identity-H
+// and every CID is the original glyph id, so the drawn content stream is
+// unaffected by the remap; only the embedded program and the /CIDToGIDMap change.
+//
+// Two edges fall back to embedding the whole font program (see embedCFF /
+// embedGlyf): a CID-keyed CFF (ROS/FDArray/FDSelect) or CFF2 (variable) font,
+// which SubsetCFF deliberately rejects because its preserve-numbering rewrite
+// cannot follow their glyph indirection; and the (in practice unreachable)
+// failure of SubsetTrueType. The fallback is behaviourally identical to the
+// pre-subsetting backend, so no font stops embedding.
+//
+// The FontDescriptor scalars (units/em, ascent, descent, bounding box, cap
+// height, italic angle, StemV estimate and the PDF /Flags bit set) come straight
+// from the opentype.Font descriptor accessors; the sfnt header is no longer
+// re-parsed here. Variable-instance baking (opentype.Font.InstanceBytes before
+// subsetting) is intentionally not performed: PDF viewers render an embedded
+// variable font at its default master anyway, so the pre-existing behaviour of
+// instanced /W advances over default-master outlines is preserved exactly, and
+// a static-instance bake is left as a future step.
 //
 // Everything is pure Go (CGO disabled) on every supported target.
 
@@ -62,7 +85,7 @@ type otfFont struct {
 	name     string
 	baseName string
 	resName  string
-	data     []byte // the original font program, embedded whole (FontFile2/3)
+	data     []byte // the original font program (embedded whole only on a subset fallback)
 
 	font *opentype.Font
 	face *opentype.Face // metrics/shaping face at unitsPerEm (scale 1 => font units)
@@ -83,11 +106,10 @@ type otfFont struct {
 	script   string
 	vertical bool
 
-	// Identity-H emission state: CID == original glyph id (CIDToGIDMap Identity).
-	usedGID   []opentype.GlyphIndex           // CIDs used, in first-seen order
-	seen      map[opentype.GlyphIndex]bool    // membership test for usedGID
-	gidAdv    map[opentype.GlyphIndex]float64 // recorded advance (font units) per CID
-	toUnicode map[opentype.GlyphIndex]rune    // best-effort CID -> code point
+	// Identity-H emission state: CID == original glyph id.
+	usedGID   []opentype.GlyphIndex        // CIDs used, in first-seen order
+	seen      map[opentype.GlyphIndex]bool // membership test for usedGID
+	toUnicode map[opentype.GlyphIndex]rune // best-effort CID -> code point
 }
 
 // RegisterFontOTF parses a TrueType or OpenType font with the go-opentype stack
@@ -110,27 +132,21 @@ func (d *Document) RegisterFontOTF(name string, data []byte, opts *OTFOptions) e
 }
 
 // parseOTF decodes the font through go-opentype, reads the descriptor scalars
-// from the sfnt header tables, and applies the requested shaping/variation
+// from the opentype.Font accessors, and applies the requested shaping/variation
 // options.
 func parseOTF(data []byte, opts *OTFOptions) (*otfFont, error) {
 	font, err := opentype.Parse(data)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrUnknownFont, err)
 	}
-	// opentype.Parse has already validated the sfnt container (magic, directory
-	// bounds and every table's extent), so the directory re-read here is
-	// guaranteed well-formed.
-	tables := sfntTables(data)
 	of := &otfFont{
 		data:      data,
 		font:      font,
-		isCFF:     hasTable(tables, "CFF "),
-		stemV:     80,
+		isCFF:     !fontHasTable(font, "glyf"),
 		seen:      map[opentype.GlyphIndex]bool{},
-		gidAdv:    map[opentype.GlyphIndex]float64{},
 		toUnicode: map[opentype.GlyphIndex]rune{},
 	}
-	of.readDescriptor(data, tables)
+	of.readDescriptor()
 	of.face = font.NewFace(int(of.unitsPerEm)) // scale 1: advances come back in font units
 
 	if opts != nil {
@@ -139,6 +155,14 @@ func parseOTF(data []byte, opts *OTFOptions) (*otfFont, error) {
 		}
 	}
 	return of, nil
+}
+
+// fontHasTable reports whether the parsed font carries the sfnt table tag. It is
+// how the backend tells a glyf font (FontFile2/CIDFontType2) from a CFF or CFF2
+// one (FontFile3/CIDFontType0): a CFF flavour is simply the absence of 'glyf'.
+func fontHasTable(f *opentype.Font, tag string) bool {
+	_, ok := f.Table(tag)
+	return ok
 }
 
 // applyOptions records the shaping flags and validates + applies a variable
@@ -163,60 +187,26 @@ func (of *otfFont) applyOptions(opts *OTFOptions) error {
 	return nil
 }
 
-// readDescriptor fills in the FontDescriptor scalars (units/em, ascent, descent,
-// bounding box, cap height, italic angle, flags) from the sfnt head/hhea/OS2/
-// post tables. go-opentype validated the container; these header reads recover
-// the descriptor metadata the opentype API does not surface.
-func (of *otfFont) readDescriptor(data []byte, tables map[string]tableRec) {
-	head := tableBytes(data, tables["head"])
-	of.unitsPerEm = float64(be16(head[18:20]))
-	of.bbox = [4]float64{
-		float64(int16(be16(head[36:38]))),
-		float64(int16(be16(head[38:40]))),
-		float64(int16(be16(head[40:42]))),
-		float64(int16(be16(head[42:44]))),
-	}
-	hhea := tableBytes(data, tables["hhea"])
-	of.ascent = float64(int16(be16(hhea[4:6])))
-	of.descent = float64(int16(be16(hhea[6:8])))
-	of.lineGap = float64(int16(be16(hhea[8:10])))
-	if r, ok := tables["OS/2"]; ok && r.length >= 90 {
-		of.capHeight = float64(int16(be16(tableBytes(data, r)[88:90])))
-	}
+// readDescriptor fills in the FontDescriptor scalars from the go-opentype
+// descriptor accessors, which decode head/hhea/OS-2/post at Parse time. The cap
+// height falls back to the ascender when the font carries none (no OS/2, or an
+// OS/2 below version 2), matching what a PDF consumer substitutes.
+func (of *otfFont) readDescriptor() {
+	f := of.font
+	of.unitsPerEm = float64(f.UnitsPerEm())
+	of.ascent = float64(f.Ascent())
+	of.descent = float64(f.Descent())
+	of.lineGap = float64(f.LineGap())
+	xMin, yMin, xMax, yMax := f.FontBBox()
+	of.bbox = [4]float64{float64(xMin), float64(yMin), float64(xMax), float64(yMax)}
+	of.capHeight = float64(f.CapHeight())
 	if of.capHeight == 0 {
 		of.capHeight = of.ascent
 	}
-	if r, ok := tables["post"]; ok && r.length >= 8 {
-		of.italicAngle = float64(int32(be32(tableBytes(data, r)[4:8]))) / 65536.0
-	}
-	flags := 0x20 // nonsymbolic
-	if of.italicAngle != 0 {
-		flags |= 0x40
-	}
-	of.flags = flags
+	of.italicAngle = f.ItalicAngle()
+	of.stemV = float64(f.StemV())
+	of.flags = f.Flags()
 }
-
-// sfntTables reads an sfnt table directory into a tag->record map (shared record
-// type with ttf.go). It assumes a well-formed directory; parseOTF only calls it
-// after opentype.Parse has validated the container.
-func sfntTables(data []byte) map[string]tableRec {
-	num := int(be16(data[4:6]))
-	tables := make(map[string]tableRec, num)
-	off := 12
-	for i := 0; i < num; i++ {
-		tag := string(data[off : off+4])
-		tables[tag] = tableRec{offset: be32(data[off+8 : off+12]), length: be32(data[off+12 : off+16])}
-		off += 16
-	}
-	return tables
-}
-
-func hasTable(tables map[string]tableRec, tag string) bool {
-	_, ok := tables[tag]
-	return ok
-}
-
-func tableBytes(data []byte, r tableRec) []byte { return data[r.offset : r.offset+r.length] }
 
 // shapedGlyph is one glyph of a laid-out run: the CID to emit (== original gid),
 // the advance the pen should move by (positioned, in font units), the glyph's
@@ -232,15 +222,16 @@ type shapedGlyph struct {
 // layoutRun turns a UTF-8 string into its glyph run: the plain cmap mapping when
 // shaping is off, or the shape.Shape result (GSUB + GPOS in font units) when it
 // is on. It is the single source of truth for both measurement and emission so
-// the two never disagree.
+// the two never disagree. Base advances come from the face's by-glyph-index
+// advance, so they honour the selected variation instance exactly like /W does.
 func (of *otfFont) layoutRun(s string) []shapedGlyph {
 	if of.shaped {
 		return of.shapeRun(s)
 	}
 	var out []shapedGlyph
 	for _, r := range s {
-		gid, _ := of.font.GlyphIndex(r)    // unmapped -> 0 (.notdef)
-		adv := float64(of.face.Advance(r)) // scale 1 => font units, variation-aware
+		gid, _ := of.font.GlyphIndex(r)       // unmapped -> 0 (.notdef)
+		adv := of.face.AdvanceIndexUnits(gid) // scale 1 => font units, variation-aware
 		out = append(out, shapedGlyph{gid: gid, advance: adv, base: adv, text: r})
 	}
 	return out
@@ -248,9 +239,9 @@ func (of *otfFont) layoutRun(s string) []shapedGlyph {
 
 // shapeRun runs the complex-text shaper. Because the face was built at
 // unitsPerEm (scale 1), the shaper's pixel advances are already in font units.
-// The /W base advance is the glyph's own context-free advance, so per-run GPOS
-// kerning and ligature spacing ride on TJ adjustments rather than a single /W
-// entry that could not capture context.
+// The /W base advance is the glyph's own context-free advance (from the face, so
+// it tracks the instance), so per-run GPOS kerning and ligature spacing ride on
+// TJ adjustments rather than a single /W entry that could not capture context.
 func (of *otfFont) shapeRun(s string) []shapedGlyph {
 	runes := []rune(s)
 	glyphs := shape.Shape(of.face, s, shape.Options{
@@ -262,20 +253,19 @@ func (of *otfFont) shapeRun(s string) []shapedGlyph {
 		out[i] = shapedGlyph{
 			gid:     g.GID,
 			advance: float64(g.XAdvance),
-			base:    float64(of.font.GlyphAdvance(g.GID)),
+			base:    of.face.AdvanceIndexUnits(g.GID),
 			text:    runes[g.Cluster],
 		}
 	}
 	return out
 }
 
-// record marks a glyph as used (assigning it a /W and ToUnicode entry) the first
-// time it appears, keeping its base advance and source code point.
+// record marks a glyph as used (assigning it a ToUnicode entry) the first time it
+// appears, keeping its source code point.
 func (of *otfFont) record(g shapedGlyph) {
 	if !of.seen[g.gid] {
 		of.seen[g.gid] = true
 		of.usedGID = append(of.usedGID, g.gid)
-		of.gidAdv[g.gid] = g.base
 		of.toUnicode[g.gid] = g.text
 	}
 }
@@ -359,6 +349,7 @@ func (of *otfFont) height(size float64) float64 {
 
 // buildObjects writes the Type0 font graph (CIDFontType0/FontFile3 for CFF, or
 // CIDFontType2/FontFile2 for glyf) and returns the Type0 dictionary reference.
+// The embedded program is a subset of the original font (see embedCFF/embedGlyf).
 func (of *otfFont) buildObjects(doc *pdfDoc) pdfRef {
 	base := of.baseName
 	if base == "" {
@@ -368,18 +359,13 @@ func (of *otfFont) buildObjects(doc *pdfDoc) pdfRef {
 
 	var fontFile pdfRef
 	var cidSubtype pdfName
+	var cidToGIDMap any
 	if of.isCFF {
-		fontFile = doc.add(&pdfStream{
-			dict: pdfDict{"Subtype": pdfName("OpenType")},
-			data: of.data,
-		})
 		cidSubtype = pdfName("CIDFontType0")
+		fontFile = of.embedCFF(doc)
 	} else {
-		fontFile = doc.add(&pdfStream{
-			dict: pdfDict{"Length1": len(of.data)},
-			data: of.data,
-		})
 		cidSubtype = pdfName("CIDFontType2")
+		fontFile, cidToGIDMap = of.embedGlyf(doc)
 	}
 
 	descriptorDict := pdfDict{
@@ -414,7 +400,7 @@ func (of *otfFont) buildObjects(doc *pdfDoc) pdfRef {
 		"W":              of.widthArray(scale),
 	}
 	if !of.isCFF {
-		cidDict["CIDToGIDMap"] = pdfName("Identity")
+		cidDict["CIDToGIDMap"] = cidToGIDMap
 	}
 	cidFont := doc.add(cidDict)
 
@@ -430,12 +416,76 @@ func (of *otfFont) buildObjects(doc *pdfDoc) pdfRef {
 	})
 }
 
+// embedCFF writes the FontFile3 program for a CFF/OpenType font: a subset 'CFF '
+// table (FontFile3 /Subtype /CIDFontType0C) when opentype.Font.SubsetCFF can
+// subset it — the common name-keyed OTF — or the whole OpenType program
+// (/Subtype /OpenType) as a graceful fallback for the fonts SubsetCFF rejects:
+// CID-keyed CFF (ROS/FDArray/FDSelect) and CFF2 (variable). Their glyph
+// indirection the preserve-numbering subsetter cannot safely rewrite, so shipping
+// the whole program keeps them embeddable, exactly as the pre-subsetting backend
+// did. SubsetCFF preserves glyph numbering, so the Identity CID->glyph mapping the
+// content stream relies on stays valid either way.
+func (of *otfFont) embedCFF(doc *pdfDoc) pdfRef {
+	if sub, err := of.font.SubsetCFF(of.usedGID); err == nil {
+		return doc.add(&pdfStream{
+			dict: pdfDict{"Subtype": pdfName("CIDFontType0C")},
+			data: sub,
+		})
+	}
+	return doc.add(&pdfStream{
+		dict: pdfDict{"Subtype": pdfName("OpenType")},
+		data: of.data,
+	})
+}
+
+// embedGlyf writes the FontFile2 program and /CIDToGIDMap value for a glyf font:
+// a SubsetTrueType subset (embedded with a /CIDToGIDMap stream mapping each CID —
+// the original glyph id the content stream emits — to its compact id in the
+// subset), or the whole program with an Identity /CIDToGIDMap as a graceful
+// fallback should subsetting fail (in practice unreachable: the used gids always
+// come from the font's own cmap/shaper and so are in range).
+func (of *otfFont) embedGlyf(doc *pdfDoc) (pdfRef, any) {
+	if sub, oldToNew, err := of.font.SubsetTrueType(of.usedGID); err == nil {
+		fontFile := doc.add(&pdfStream{
+			dict: pdfDict{"Length1": len(sub)},
+			data: sub,
+		})
+		return fontFile, doc.add(&pdfStream{data: of.cidToGIDMap(oldToNew)})
+	}
+	fontFile := doc.add(&pdfStream{
+		dict: pdfDict{"Length1": len(of.data)},
+		data: of.data,
+	})
+	return fontFile, pdfName("Identity")
+}
+
+// cidToGIDMap builds the CIDFontType2 /CIDToGIDMap stream for a subset glyf font:
+// a big-endian array indexed by CID (the original glyph id) holding that glyph's
+// id in the subset. It is sized to the largest used CID; unused slots stay zero
+// (mapping to .notdef), and every emitted CID resolves through oldToNew.
+func (of *otfFont) cidToGIDMap(oldToNew map[opentype.GlyphIndex]opentype.GlyphIndex) []byte {
+	maxCID := 0
+	for _, g := range of.usedGID {
+		if int(g) > maxCID {
+			maxCID = int(g)
+		}
+	}
+	m := make([]byte, 2*(maxCID+1))
+	for _, orig := range of.usedGID {
+		sub := oldToNew[orig]
+		m[2*int(orig)] = byte(sub >> 8)
+		m[2*int(orig)+1] = byte(sub)
+	}
+	return m
+}
+
 // widthArray builds the CIDFont /W array in 1000-em units, one entry per used
-// CID (== original glyph id), in first-seen order.
+// CID (== original glyph id), in first-seen order. The advance comes from the
+// face's by-glyph-index advance, so it tracks the selected variation instance.
 func (of *otfFont) widthArray(scale float64) pdfArray {
 	out := make(pdfArray, 0, len(of.usedGID)*2)
 	for _, gid := range of.usedGID {
-		out = append(out, pdfArray{int(gid), pdfArray{of.gidAdv[gid] * scale}})
+		out = append(out, pdfArray{int(gid), pdfArray{of.face.AdvanceIndexUnits(gid) * scale}})
 	}
 	return out
 }
