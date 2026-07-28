@@ -364,3 +364,122 @@ func synthGlyfFont(t *testing.T, n int, advances []int, withOS2, withPost bool, 
 	}
 	return synthTables(tables)
 }
+
+// --- synthetic CID-keyed CFF (for the SubsetCFF fallback path) --------------
+
+// cffIndexTest encodes items as a CFF INDEX with 1-byte offsets (all synthetic
+// items are tiny), matching the on-disk INDEX structure opentype.Parse expects.
+func cffIndexTest(items [][]byte) []byte {
+	w := &bw{}
+	w.u16(uint16(len(items)))
+	if len(items) == 0 {
+		return w.b
+	}
+	w.u8(1) // offSize
+	off := 1
+	w.u8(uint8(off))
+	for _, it := range items {
+		off += len(it)
+		w.u8(uint8(off))
+	}
+	for _, it := range items {
+		w.b = append(w.b, it...)
+	}
+	return w.b
+}
+
+// dictLongTest encodes a CFF DICT integer operand in the fixed-width 5-byte form
+// (marker 29), so the Top DICT length is invariant to the offset values it holds.
+func dictLongTest(v int) []byte {
+	return []byte{29, byte(uint32(int32(v)) >> 24), byte(uint32(int32(v)) >> 16), byte(uint32(int32(v)) >> 8), byte(uint32(int32(v)))}
+}
+
+// dictOpTest encodes a CFF DICT operator (op>=1200 uses the two-byte escape form).
+func dictOpTest(op int) []byte {
+	if op >= 1200 {
+		return []byte{12, byte(op - 1200)}
+	}
+	return []byte{byte(op)}
+}
+
+// buildCIDKeyedCFF assembles a minimal-but-valid CID-keyed 'CFF ' table: a Top
+// DICT carrying ROS + FDArray + FDSelect (the operators that mark a CID-keyed
+// font), which opentype.Parse accepts but SubsetCFF deliberately rejects. Three
+// glyphs (0 .notdef + two drawn) are enough to register, draw and embed through
+// the whole-program fallback.
+func buildCIDKeyedCFF() []byte {
+	header := []byte{1, 0, 4, 1}
+	name := cffIndexTest([][]byte{[]byte("SYNTH")})
+	strIdx := cffIndexTest([][]byte{[]byte("Adobe"), []byte("Identity")})
+	gsubrIdx := cffIndexTest(nil)
+
+	// Charstrings: three empty glyphs (a lone endchar each). The fallback path
+	// never inspects outlines; it only needs Parse to accept and SubsetCFF to
+	// reject the CID-keyed font.
+	glyphs := [][]byte{{14}, {14}, {14}}
+	n := len(glyphs)
+	csIdx := cffIndexTest(glyphs)
+
+	// Charset format 0 (one CID per glyph 1..n-1).
+	charset := []byte{0}
+	for i := 1; i < n; i++ {
+		charset = append(charset, byte(i>>8), byte(i))
+	}
+	// FDSelect format 3: one range covering every glyph -> font dict 0.
+	fdselect := []byte{3, 0, 1, 0, 0, byte(n >> 8), byte(n)}
+	// FDArray: one Font DICT with an (empty) Private entry.
+	fd := append(append(dictLongTest(0), dictLongTest(0)...), dictOpTest(18)...)
+	fdarray := cffIndexTest([][]byte{fd})
+
+	const sidAdobe, sidIdentity = 391, 392 // first custom SIDs after the 391 standard strings
+	encodeTop := func(csOff, charsetOff, fdaOff, fdsOff int) []byte {
+		var td []byte
+		td = append(td, dictLongTest(sidAdobe)...)
+		td = append(td, dictLongTest(sidIdentity)...)
+		td = append(td, dictLongTest(0)...)
+		td = append(td, dictOpTest(1230)...) // ROS
+		td = append(td, dictLongTest(csOff)...)
+		td = append(td, dictOpTest(17)...) // CharStrings
+		td = append(td, dictLongTest(charsetOff)...)
+		td = append(td, dictOpTest(15)...) // charset
+		td = append(td, dictLongTest(2)...)
+		td = append(td, dictOpTest(1206)...) // CharstringType 2
+		td = append(td, dictLongTest(fdaOff)...)
+		td = append(td, dictOpTest(1236)...) // FDArray
+		td = append(td, dictLongTest(fdsOff)...)
+		td = append(td, dictOpTest(1237)...) // FDSelect
+		return td
+	}
+	topLen := len(cffIndexTest([][]byte{encodeTop(0, 0, 0, 0)}))
+	base := len(header) + len(name) + topLen + len(strIdx) + len(gsubrIdx)
+	csOff := base
+	charsetOff := csOff + len(csIdx)
+	fdsOff := charsetOff + len(charset)
+	fdaOff := fdsOff + len(fdselect)
+	topIdx := cffIndexTest([][]byte{encodeTop(csOff, charsetOff, fdaOff, fdsOff)})
+
+	out := append([]byte{}, header...)
+	out = append(out, name...)
+	out = append(out, topIdx...)
+	out = append(out, strIdx...)
+	out = append(out, gsubrIdx...)
+	out = append(out, csIdx...)
+	out = append(out, charset...)
+	out = append(out, fdselect...)
+	out = append(out, fdarray...)
+	return out
+}
+
+// synthCIDKeyedCFFFont wraps buildCIDKeyedCFF in an sfnt with the minimal
+// companion tables opentype.Parse requires.
+func synthCIDKeyedCFFFont(t *testing.T) []byte {
+	t.Helper()
+	return synthTables(map[string][]byte{
+		"head": headTable(1000, 0),
+		"maxp": maxpTable(3),
+		"hhea": hheaTable(800, -200, 0, 3),
+		"hmtx": hmtxTable([]int{500, 500, 500}, []int{0, 0, 0}, 3),
+		"cmap": cmap4Map(map[rune]uint16{'A': 1, 'B': 2}),
+		"CFF ": buildCIDKeyedCFF(),
+	})
+}

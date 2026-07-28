@@ -17,6 +17,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-opentype/opentype"
 	"rsc.io/pdf"
 )
 
@@ -47,8 +48,10 @@ func TestOTFEmbedCFF(t *testing.T) {
 	}
 	b := mustRender(t, d)
 
-	// Structural markers of a CIDFontType0 / FontFile3 OpenType embed.
-	for _, marker := range []string{"CIDFontType0", "FontFile3", "OpenType", "Type0", "Identity-H"} {
+	// Structural markers of a subset CIDFontType0 / FontFile3 (CIDFontType0C)
+	// embed. Since go-opentype v0.5 the CFF program is a SubsetCFF subset, so the
+	// FontFile3 /Subtype is /CIDFontType0C (a bare 'CFF ' table), not /OpenType.
+	for _, marker := range []string{"CIDFontType0", "FontFile3", "CIDFontType0C", "Type0", "Identity-H"} {
 		if !bytes.Contains(b, []byte(marker)) {
 			t.Errorf("embedded PDF missing %q", marker)
 		}
@@ -56,7 +59,7 @@ func TestOTFEmbedCFF(t *testing.T) {
 	if bytes.Contains(b, []byte("CIDToGIDMap")) {
 		t.Error("CFF CIDFontType0 must not carry CIDToGIDMap")
 	}
-	// rsc.io/pdf must be able to re-open the produced file.
+	// rsc.io/pdf must be able to re-open the produced file (structural oracle).
 	r, err := pdf.NewReader(bytes.NewReader(b), int64(len(b)))
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
@@ -293,4 +296,192 @@ func TestOTFFormattedAndRepeat(t *testing.T) {
 		t.Fatalf("glyph 'a' recorded %d times, want 1", count)
 	}
 	mustRender(t, d)
+}
+
+// ---- subsetting proof: glyf (SubsetTrueType + /CIDToGIDMap) -----------------
+
+// otfStream fetches the *pdfStream stored at ref in a white-box pdfDoc.
+func otfStream(t *testing.T, doc *pdfDoc, ref pdfRef) *pdfStream {
+	t.Helper()
+	s, ok := doc.objs[ref.id-1].(*pdfStream)
+	if !ok {
+		t.Fatalf("object %d is not a stream (%T)", ref.id, doc.objs[ref.id-1])
+	}
+	return s
+}
+
+func TestOTFSubsetGlyfSmallerAndReparses(t *testing.T) {
+	defer fixedClock()()
+	// A real glyf font routed through the OTF backend (FontFile2/CIDFontType2).
+	whole, err := os.ReadFile(filepath.Join("testdata", "goregular.ttf"))
+	if err != nil {
+		t.Fatalf("read TTF: %v", err)
+	}
+	of, err := parseOTF(whole, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if of.isCFF {
+		t.Fatal("goregular.ttf should route as a glyf font")
+	}
+	of.name = "Go"
+	// Use only a handful of glyphs so the subset is a small fraction of the font.
+	of.operand("Hello World")
+
+	doc := &pdfDoc{}
+	fontFileRef, cidMapAny := of.embedGlyf(doc)
+	sub := otfStream(t, doc, fontFileRef).data
+	if len(sub) >= len(whole) {
+		t.Fatalf("subset (%d) not smaller than whole font (%d)", len(sub), len(whole))
+	}
+
+	// The embedded FontFile2 is a valid sfnt with far fewer glyphs than the whole
+	// font, and every kept CID re-parses to its glyph via the /CIDToGIDMap remap.
+	sf, err := opentype.Parse(sub)
+	if err != nil {
+		t.Fatalf("re-parse subset: %v", err)
+	}
+	if sf.NumGlyphs() >= of.font.NumGlyphs() {
+		t.Fatalf("subset glyphs %d not fewer than whole %d", sf.NumGlyphs(), of.font.NumGlyphs())
+	}
+	cidMapRef, ok := cidMapAny.(pdfRef)
+	if !ok {
+		t.Fatalf("subset glyf must carry a /CIDToGIDMap stream, got %T", cidMapAny)
+	}
+	cidMap := otfStream(t, doc, cidMapRef).data
+	face := sf.NewFace(64)        // small size: we only test outline presence, not fidelity
+	for _, r := range "HeloWrd" { // the distinct kept letters (space has no outline)
+		orig, _ := of.font.GlyphIndex(r)
+		subGID := opentype.GlyphIndex(int(cidMap[2*int(orig)])<<8 | int(cidMap[2*int(orig)+1]))
+		if subGID == 0 {
+			t.Fatalf("CID %d (%q) not remapped in /CIDToGIDMap", orig, r)
+		}
+		if _, mask, _, _, ok := face.GlyphMaskIndex(subGID, 0, 0); !ok || mask == nil {
+			t.Errorf("kept glyph %q (subset gid %d) has no outline after subsetting", r, subGID)
+		}
+	}
+}
+
+// ---- subsetting proof: CFF (SubsetCFF, CIDFontType0C) ----------------------
+
+// wrapCFF wraps a bare 'CFF ' table in a minimal sfnt using src's real companion
+// tables, so opentype can re-parse a SubsetCFF result (which is a bare table, not
+// a container) and its glyph outlines can be inspected.
+func wrapCFF(t *testing.T, cff []byte, src *opentype.Font) []byte {
+	t.Helper()
+	tabs := map[string][]byte{"CFF ": cff}
+	for _, tag := range []string{"head", "maxp", "hhea", "hmtx", "cmap"} {
+		b, ok := src.Table(tag)
+		if !ok {
+			t.Fatalf("source font missing %q", tag)
+		}
+		tabs[tag] = b
+	}
+	return synthTables(tabs)
+}
+
+func TestOTFSubsetCFFSmallerAndReparses(t *testing.T) {
+	defer fixedClock()()
+	whole := sourceSerifOTF(t)
+	of, err := parseOTF(whole, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !of.isCFF {
+		t.Fatal("SourceSerif4 should route as a CFF font")
+	}
+	of.name = "Serif"
+	of.operand("Hello") // keep only H e l o (+ .notdef)
+
+	doc := &pdfDoc{}
+	sub := otfStream(t, doc, of.embedCFF(doc)).data
+	origCFF, _ := of.font.Table("CFF ")
+	if len(sub) >= len(origCFF) {
+		t.Fatalf("subset CFF (%d) not smaller than whole 'CFF ' table (%d)", len(sub), len(origCFF))
+	}
+
+	// Re-wrap and re-parse: kept glyphs keep their outlines, an unused glyph is
+	// emptied by the charstring subsetter.
+	sf, err := opentype.Parse(wrapCFF(t, sub, of.font))
+	if err != nil {
+		t.Fatalf("re-parse wrapped subset: %v", err)
+	}
+	face := sf.NewFace(64) // small size: we only test outline presence, not fidelity
+	keptGID, _ := of.font.GlyphIndex('H')
+	if _, mask, _, _, ok := face.GlyphMaskIndex(keptGID, 0, 0); !ok || mask == nil {
+		t.Errorf("kept glyph 'H' (gid %d) lost its outline in the CFF subset", keptGID)
+	}
+	dropGID, _ := of.font.GlyphIndex('Z') // 'Z' was never drawn -> emptied by the subsetter
+	if _, mask, _, _, _ := face.GlyphMaskIndex(dropGID, 0, 0); mask != nil {
+		t.Errorf("unused glyph 'Z' (gid %d) still has an outline; CFF not subset", dropGID)
+	}
+}
+
+// ---- CID-keyed CFF / CFF2 fallback: whole program embedded -----------------
+
+func TestOTFCFFFallbackWholeEmbed(t *testing.T) {
+	defer fixedClock()()
+	// A CID-keyed CFF (ROS/FDArray/FDSelect) is one SubsetCFF rejects, so the
+	// backend must fall back to embedding the whole OpenType program.
+	whole := synthCIDKeyedCFFFont(t)
+	of, err := parseOTF(whole, nil)
+	if err != nil {
+		t.Fatalf("parse CID-keyed CFF: %v", err)
+	}
+	if !of.isCFF {
+		t.Fatal("CID-keyed CFF should route as a CFF font")
+	}
+	of.name = "CID"
+	of.operand("AB")
+
+	doc := &pdfDoc{}
+	stream := otfStream(t, doc, of.embedCFF(doc))
+	if got := stream.dict["Subtype"]; got != pdfName("OpenType") {
+		t.Fatalf("fallback FontFile3 /Subtype = %v, want OpenType", got)
+	}
+	if len(stream.data) != len(whole) {
+		t.Fatalf("fallback embeds %d bytes, want the whole %d-byte program", len(stream.data), len(whole))
+	}
+
+	// End-to-end: the produced PDF still embeds and re-opens.
+	d := New(Options{})
+	if err := d.RegisterFontOTF("CID", whole, nil); err != nil {
+		t.Fatal(err)
+	}
+	d.Font("CID", StyleNormal)
+	d.Text("AB", nil)
+	b := mustRender(t, d)
+	if !bytes.Contains(b, []byte("OpenType")) {
+		t.Error("CID-keyed fallback should embed a /Subtype /OpenType FontFile3")
+	}
+	if _, err := pdf.NewReader(bytes.NewReader(b), int64(len(b))); err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+}
+
+// ---- glyf subset failure falls back to a whole embed + Identity map --------
+
+func TestOTFGlyfFallbackWholeEmbed(t *testing.T) {
+	defer fixedClock()()
+	whole := synthGlyfFont(t, 3, []int{0, 500, 480}, false, false, 0, nil)
+	of, err := parseOTF(whole, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	of.name = "Syn"
+	// Force SubsetTrueType to fail with an out-of-range CID so the graceful
+	// whole-embed / Identity-map fallback branch runs.
+	const badGID = opentype.GlyphIndex(60000) // valid uint16, but past the 3-glyph font
+	of.usedGID = []opentype.GlyphIndex{badGID}
+	of.seen[badGID] = true
+	of.toUnicode[badGID] = 'A'
+
+	doc := &pdfDoc{}
+	fontFileRef, cidMapAny := of.embedGlyf(doc)
+	if got := cidMapAny; got != pdfName("Identity") {
+		t.Fatalf("glyf fallback /CIDToGIDMap = %v, want Identity", got)
+	}
+	if data := otfStream(t, doc, fontFileRef).data; len(data) != len(whole) {
+		t.Fatalf("glyf fallback embeds %d bytes, want the whole %d", len(data), len(whole))
+	}
 }
