@@ -27,6 +27,20 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version: stable
+      # ⛔ The differential tests here compare this package against a LIVE
+      # MRI, and nothing installed one. They skipped on every lane, always,
+      # and a skip is green.
+      #
+      # Not on Windows: there is no MRI there and the tests say so.
+      - if: runner.os != 'Windows'
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+
+      # The live-gem oracle wants the real library, not just an interpreter.
+      - if: runner.os != 'Windows'
+        run: gem install --no-document prawn pdf-reader
+
       - run: go version
       - run: go vet ./...
       - run: go build ./...
