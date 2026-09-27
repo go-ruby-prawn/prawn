@@ -56,12 +56,30 @@ jobs:
         shell: bash
         run: |
           COVERPKG=$(go list ./... | paste -sd, -)
-          go test -race -coverpkg="$COVERPKG" -coverprofile=cover.out ./...
+          # ⛔ -v and a tee, so the guard below has something to read. Without
+          # -v there are no `--- SKIP` lines at all, and counting zero of them
+          # looks exactly like counting zero because nothing skipped. -count=1
+          # because installing a program does not invalidate the Go test cache:
+          # exec.LookPath only stats, so `ok (cached)` can replay a run recorded
+          # before ruby existed on the machine.
+          set -o pipefail
+          go test -count=1 -v -race -coverpkg="$COVERPKG" -coverprofile=cover.out ./... 2>&1 | tee test-output.txt
           go tool cover -func=cover.out | tail -n 25
           cov=$(go tool cover -func=cover.out | tail -1 | awk '{print $3}' | tr -d '%')
           echo "coverage: ${cov}%"
           awk -v t="$cov" 'BEGIN { exit !(t+0 >= 100.0) }' || {
             echo "::error::coverage ${cov}% < 100%"; exit 1; }
+
+      # The oracle's only skip reason is a missing or too-old interpreter, so
+      # its presence means the differential test did not happen.
+      - name: the MRI oracle must have judged
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if grep -q "ruby prawn+pdf-reader not available" test-output.txt; then
+            echo "::error::the MRI oracle skipped; the differential test did not run"
+            exit 1
+          fi
 
   # Validate the library on the six supported 64-bit targets. amd64/arm64 run
   # natively; the rest run the suite under qemu-user. PDF output is a
