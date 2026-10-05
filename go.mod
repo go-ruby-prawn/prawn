@@ -1,6 +1,6 @@
 module github.com/go-ruby-prawn/prawn
 
-go 1.26.4
+go 1.27.1
 
 require (
 	github.com/go-opentype/opentype v0.13.0
