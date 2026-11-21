@@ -23,6 +23,8 @@ github.com/go-opentype/opentype v0.21.1 h1:axfaZjo6acnY9OcFHC/q5gaSqyc/KjuaNJ6Z7
 github.com/go-opentype/opentype v0.21.1/go.mod h1:cyTZyPcwVFR4MTHnCj7a6tk2tGIB6deakpefu/apDjg=
 github.com/go-opentype/opentype v0.22.0 h1:AWxuNf8g6F5lFZ6wrp0Z097yrNANbE0F4b+etGtaWtI=
 github.com/go-opentype/opentype v0.22.0/go.mod h1:xzFnB0oUWXuU1AxQl0CgtQpV8iWY7f5/RRGc9diiBZs=
+github.com/go-opentype/opentype v0.24.0 h1:tyRvk9fbh8zaqLYK0PNhzrG0f4rMQz3cp6co9WpuHv8=
+github.com/go-opentype/opentype v0.24.0/go.mod h1:xzFnB0oUWXuU1AxQl0CgtQpV8iWY7f5/RRGc9diiBZs=
 github.com/go-opentype/shape v0.5.0 h1:jHNaOMHNBdDj5EixOevlrrsi92svMxvVMKN7GYaPfxo=
 github.com/go-opentype/shape v0.5.0/go.mod h1:3ImRYNIj6zpwWQ/DV3BWhgMFfmzDITH6XpZw2auQHTo=
 github.com/go-opentype/shape v0.7.0 h1:hXUkI4xdpkzq31ZYf/6zfkDAgRLZnTjI1q8DWLu5MGQ=
